@@ -1963,11 +1963,51 @@ db.collection('registrations').onSnapshot(snapshot => {
 }, err => console.error('[CEE] registrations listener error:', err));
 
 // ═══════════════════════════════════════════════════════════════════════════
+// AUTO-INITIALIZE FIRESTORE DOCUMENTS ON STARTUP
+// ═══════════════════════════════════════════════════════════════════════════
+async function initializeConfig() {
+  try {
+    // Ensure config/season exists
+    const seasonSnap = await db.collection('config').doc('season').get();
+    if (!seasonSnap.exists) {
+      console.log('[CEE] Creating missing config/season document...');
+      await db.collection('config').doc('season').set({ activeSeasonId: 'season_1' });
+      console.log('[CEE] config/season created.');
+    } else {
+      console.log('[CEE] config/season OK — activeSeasonId:', seasonSnap.data().activeSeasonId);
+    }
+
+    // Ensure seasons/season_1 exists
+    const activeId = seasonSnap.exists ? (seasonSnap.data().activeSeasonId || 'season_1') : 'season_1';
+    const s1Snap = await db.collection('seasons').doc(activeId).get();
+    if (!s1Snap.exists) {
+      console.log('[CEE] Creating missing seasons/' + activeId + ' document...');
+      await db.collection('seasons').doc(activeId).set({
+        status: 'active',
+        season: 1,
+        format: 20,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      console.log('[CEE] seasons/' + activeId + ' created.');
+    } else {
+      console.log('[CEE] seasons/' + activeId + ' OK — status:', s1Snap.data().status);
+    }
+
+    // Invalidate season ID cache so fresh data is used
+    _invalidateSeasonIdCache();
+    console.log('[CEE] Firestore config initialization complete.');
+  } catch (e) {
+    console.error('[CEE] initializeConfig error:', e.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // START SERVER
 // ═══════════════════════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`[CEE] Backend running on port ${PORT}`);
+  initializeConfig();
   console.log('[CEE] Scheduled jobs active: windowManager(15m), submissionDeadlineEnforcer(10m),');
   console.log('[CEE]   autoApprover(5m), disputeAutoResolver(30m), doubleConsentExpiryEnforcer(30m),');
   console.log('[CEE]   swissPairingEngine(6h), registrationDeadlineChecker(daily),');
