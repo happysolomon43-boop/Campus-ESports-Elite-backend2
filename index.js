@@ -99,6 +99,13 @@ function assertAdminSecret(req, res) {
 // ── Nodemailer transporter (lazy-init) ────────────────────────────────────
 let _transporter = null;
 function getTransporter() {
+  if (!env.gmail || !env.gmail.user || !env.gmail.pass) {
+    throw new Error(
+      'Email not configured. Set GMAIL_USER and GMAIL_PASS in Railway → Variables.\n' +
+      'IMPORTANT: GMAIL_PASS must be a Gmail App Password (16 chars, no spaces), NOT your regular Gmail password.\n' +
+      'Generate one at: myaccount.google.com → Security → 2-Step Verification → App Passwords'
+    );
+  }
   if (!_transporter) {
     _transporter = nodemailer.createTransport({
       service: 'gmail',
@@ -157,6 +164,30 @@ async function sendEmail(to, subject, htmlBody, textBody) {
   }
 }
 
+// ── WhatsApp relay helper — generates wa.me link for admin to forward ─────
+// Called alongside email/telegram when a player has a whatsappNumber.
+// Stores a pending relay record in notifications so admin can tap to send.
+async function _queueWhatsAppRelay(fixtureId, playerId, playerData, messageText) {
+  if (!playerData.whatsappNumber) return;
+  const clean = String(playerData.whatsappNumber).replace(/\D/g,'');
+  if (!clean) return;
+  const encoded = encodeURIComponent(messageText.replace(/<[^>]+>/g,'').trim()); // strip HTML tags
+  const waLink  = `https://wa.me/${clean}?text=${encoded}`;
+  await db.collection('notifications').add({
+    fixtureId:     fixtureId || null,
+    recipientId:   playerId,
+    recipientName: playerData.clubName || playerData.gameName || playerId,
+    channel:       'whatsapp_relay',
+    eventType:     'WHATSAPP_RELAY',
+    sentAt:        admin.firestore.FieldValue.serverTimestamp(),
+    status:        'pending_relay',
+    retryCount:    0,
+    waLink,
+    messageText:   messageText.replace(/<[^>]+>/g,'').trim().substring(0, 500),
+    whatsappNumber: clean
+  }).catch(()=>{});
+}
+
 // ── Notification logger — NOI-3: stores payload for retry reconstruction ──
 async function logNotif(fixtureId, recipientId, channel, eventType, status, err, payload) {
   const doc = {
@@ -210,112 +241,154 @@ async function getFixtures(seasonId) {
 // ═══════════════════════════════════════════════════════════════════════════
 // INTERNAL NOTIFICATION HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
+// ── _notifyPlayer — central helper, tries ALL channels a player has ────────
+// Priority: Telegram → Email → WhatsApp relay (always queued if number exists)
+async function _notifyPlayer(pid, fixtureId, eventType, subject, htmlBody, tgText) {
+  if (!pid) return;
+  const snap = await db.collection('players').doc(pid).get();
+  if (!snap.exists) return;
+  const p = { id: pid, ...snap.data() };
+  const results = { telegram: null, email: null, whatsapp: null };
+
+  // Telegram
+  if (p.telegramChatId && p.notificationsTelegram !== false) {
+    const r = await sendTelegram(p.telegramChatId, tgText);
+    results.telegram = (r && r.ok) ? 'sent' : 'failed';
+    if (!r || !r.ok) console.warn(`[CEE] Telegram failed for ${pid}:`, r && r.description);
+  }
+
+  // Email
+  if (p.email && p.notificationsEmail !== false) {
+    const r = await sendEmail(p.email, subject, htmlBody);
+    results.email = r.success ? 'sent' : 'failed';
+    if (!r.success) console.warn(`[CEE] Email failed for ${pid}:`, r.error);
+  }
+
+  // WhatsApp relay — always queue if player has a number, regardless of other channels
+  if (p.whatsappNumber) {
+    await _queueWhatsAppRelay(fixtureId, pid, p, tgText);
+    results.whatsapp = 'queued';
+  }
+
+  // Log the attempt
+  const channel = [
+    results.telegram && 'telegram',
+    results.email    && 'email',
+    results.whatsapp && 'whatsapp'
+  ].filter(Boolean).join('+') || 'none';
+
+  await logNotif(fixtureId, pid, channel, eventType, 'sent', null, {
+    messageText: tgText, emailSubject: subject, emailHtmlBody: htmlBody,
+    telegramChatId: p.telegramChatId || null, email: p.email || null
+  }).catch(() => {});
+
+  return results;
+}
+
 async function _notifyBothReady(fix, fixtureId) {
-  const msg  = `⚡ <b>BOTH PLAYERS READY!</b>\n\nYour match is now <b>IN PROGRESS</b>.\nPlay your game and submit your result screenshot via the Player Hub.\n\n<b>Deadline:</b> 5 hours from now (or 1 hour before window closes).`;
+  const tg   = `⚡ <b>BOTH PLAYERS READY!</b>\n\nYour match is now <b>IN PROGRESS</b>.\nPlay your game and submit your result screenshot via the Player Hub.\n\n<b>Deadline:</b> 5 hours from now (or 1 hour before window closes).`;
   const html = `<p>⚡ Both you and your opponent have clicked Ready!</p>
     <p>Your match is now <strong>IN PROGRESS</strong>. Play your game and submit your result screenshot from the Player Hub.</p>
     <div class="hl">Submission deadline: 5 hours from now (or 1 hour before the window closes)</div>`;
-  const promises = [];
-  for (const pid of [fix.playerAId, fix.playerBId].filter(Boolean)) {
-    const p = await db.collection('players').doc(pid).get();
-    if (!p.exists) continue;
-    const pd = p.data();
-    if (pd.telegramChatId && pd.notificationsTelegram !== false) promises.push(sendTelegram(pd.telegramChatId, msg));
-    if (pd.email && pd.notificationsEmail !== false) promises.push(sendEmail(pd.email, 'CEE — Both Players Ready!', html));
-    promises.push(logNotif(fixtureId, pid, 'both', 'BOTH_READY', 'sent', null, {
-      messageText: msg, emailSubject: 'CEE — Both Players Ready!', emailHtmlBody: html,
-      telegramChatId: pd.telegramChatId || null, email: pd.email || null
-    }));
-  }
-  await Promise.allSettled(promises);
+  await Promise.allSettled([
+    _notifyPlayer(fix.playerAId, fixtureId, 'BOTH_READY', 'CEE — Match is Live! 🎮', html, tg),
+    _notifyPlayer(fix.playerBId, fixtureId, 'BOTH_READY', 'CEE — Match is Live! 🎮', html, tg)
+  ]);
 }
 
 async function _notifyPartnerReady(otherId, fix, fixtureId) {
   if (!otherId) return;
-  const p = await db.collection('players').doc(otherId).get();
-  if (!p.exists) return;
-  const pd  = p.data();
-  const msg = `⏳ <b>Your opponent is Ready!</b>\n\nPlease log in to the CEE Player Hub and click Ready to start the match.`;
+  const tg   = `⏳ <b>Your opponent is Ready!</b>\n\nLog in to the CEE Player Hub and click Ready to start your match.`;
   const html = `<p>⏳ Your opponent has clicked Ready for your upcoming fixture.</p>
-    <p>Please log in to the <strong>CEE Player Hub</strong> and click <strong>Ready</strong> to start the match.</p>`;
-  if (pd.telegramChatId && pd.notificationsTelegram !== false) await sendTelegram(pd.telegramChatId, msg);
-  if (pd.email && pd.notificationsEmail !== false) await sendEmail(pd.email, 'CEE — Your Opponent is Ready!', html);
-  await logNotif(fixtureId, otherId, 'both', 'PARTNER_READY', 'sent', null, {
-    messageText: msg, emailSubject: 'CEE — Your Opponent is Ready!', emailHtmlBody: html,
-    telegramChatId: pd.telegramChatId || null, email: pd.email || null
-  });
+    <p>Log in to the <strong>CEE Player Hub</strong> and click <strong>Ready</strong> to start the match.</p>`;
+  await _notifyPlayer(otherId, fixtureId, 'PARTNER_READY', 'CEE — Opponent is Ready!', html, tg);
 }
 
 async function _sendMatchNotifications(type, fixtureId, playerAId, playerBId, seasonId) {
-  const fetchPlayer = async id => {
-    if (!id) return null;
-    const d = await db.collection('players').doc(id).get();
-    return d.exists ? { id: d.id, ...d.data() } : null;
-  };
-  const pA = await fetchPlayer(playerAId);
-  const pB = await fetchPlayer(playerBId);
   const adminEmail = env.admin && env.admin.email;
   const adminChat  = env.telegram && env.telegram.admin_chat_id;
 
-  const notifyPlayer = async (p, subject, html, tg) => {
-    if (!p) return;
-    if (p.email && p.notificationsEmail !== false) await sendEmail(p.email, subject, html);
-    if (p.telegramChatId && p.notificationsTelegram !== false) await sendTelegram(p.telegramChatId, tg);
-    await logNotif(fixtureId, p.id, 'both', type, 'sent', null, {
-      messageText: tg, emailSubject: subject, emailHtmlBody: html,
-      telegramChatId: p.telegramChatId || null, email: p.email || null
-    });
-  };
+  const both = async (subj, html, tg) => Promise.allSettled([
+    _notifyPlayer(playerAId, fixtureId, type, subj, html, tg),
+    _notifyPlayer(playerBId, fixtureId, type, subj, html, tg)
+  ]);
 
   if (type === 'WINDOW_OPEN') {
-    const h = `<p>🟢 Your match window is now <strong>OPEN</strong>!</p><p>Log in to the CEE Player Hub, click Ready, and play your fixture.</p>`;
-    const t = `🟢 <b>Match window OPEN!</b>\nLog in to the CEE Player Hub and click Ready.`;
-    await notifyPlayer(pA,'CEE — Match Window Open!',h,t);
-    await notifyPlayer(pB,'CEE — Match Window Open!',h,t);
+    await both(
+      'CEE — Match Window Open! 🟢',
+      `<p>🟢 Your match window is now <strong>OPEN</strong>!</p><p>Log in to the CEE Player Hub to propose a play time with your opponent.</p>`,
+      `🟢 <b>Match window OPEN!</b>\n\nLog in to the CEE Player Hub to propose a match time with your opponent.\n🌐 ${process.env.SITE_URL || 'https://cee-esports.web.app'}`
+    );
+  }
+  if (type === 'READY_REMINDER_1') {
+    await both(
+      'CEE — Match Window Reminder ⏰',
+      `<p>⏰ Your match window has been open for a while, but no time has been agreed yet.</p><p>Log in to the CEE Player Hub and propose a match time with your opponent.</p>`,
+      `⏰ <b>Reminder:</b> Your match window is open!\n\nYou haven't agreed on a time yet. Log in to the Player Hub and propose a time before the window closes.`
+    );
+  }
+  if (type === 'READY_REMINDER_2') {
+    await both(
+      'CEE — Proposal Waiting for Response ⏳',
+      `<p>⏳ A match time has been proposed but hasn't been responded to yet.</p><p>Log in to the CEE Player Hub to respond — you have limited time before the window closes.</p>`,
+      `⏳ <b>Action required!</b>\n\nA match time proposal is waiting for your response on the CEE Player Hub. Please respond before the window closes!`
+    );
+  }
+  if (type === 'DEADLINE_REMINDER') {
+    await both(
+      'CEE — 1 Hour Left in Match Window ⚠️',
+      `<p>⚠️ <strong>1 hour remaining</strong> in your match window.</p><p>If no time is agreed and no result is submitted, the match will be voided. Log in now.</p>`,
+      `⚠️ <b>1 hour left!</b>\n\nYour match window closes in about 1 hour. Log in to the Player Hub immediately to agree on a time or check in.`
+    );
   }
   if (type === 'FORFEIT_APPLIED') {
-    const h = `<p>⚠️ A forfeit has been applied to your fixture because one or both players did not complete the required steps within the match window.</p><p>Check the CEE website for the final result.</p>`;
-    const t = `⚠️ <b>Forfeit applied to your fixture.</b>\nA player did not complete the required steps in time. Check the CEE website for the result.`;
-    await notifyPlayer(pA,'CEE — Forfeit Applied',h,t);
-    await notifyPlayer(pB,'CEE — Forfeit Applied',h,t);
-    if (adminChat) await sendTelegram(adminChat, `⚠️ Forfeit applied to fixture ${fixtureId}`);
+    await both(
+      'CEE — Forfeit Applied ⚠️',
+      `<p>⚠️ A forfeit has been applied to your fixture because a player committed to a time and did not check in.</p><p>Check the CEE website for the final result.</p>`,
+      `⚠️ <b>Forfeit applied to your fixture.</b>\n\nA player committed to a time and did not check in. Check the CEE website for the result.`
+    );
+    if (adminChat) await sendTelegram(adminChat, `⚠️ Forfeit applied to fixture ${fixtureId}`).catch(()=>{});
   }
   if (type === 'RESULT_PENDING') {
-    if (adminEmail) await sendEmail(adminEmail,'CEE — Result Awaiting Approval',
+    if (adminEmail) await sendEmail(adminEmail, 'CEE — Result Awaiting Approval',
       `<p>A match result is ready for your review in the <strong>Result Queue</strong>.</p>
        <div class="hl">Fixture ID: ${fixtureId}</div>
-       <p>Auto-approve triggers in 45 minutes if no action is taken.</p>`);
+       <p>Auto-approve triggers in 45 minutes if no action is taken.</p>`).catch(()=>{});
     if (adminChat) await sendTelegram(adminChat,
-      `📋 <b>Result awaiting approval</b>\nFixture: ${fixtureId}\nAuto-approves in 45 minutes.`);
+      `📋 <b>Result awaiting approval</b>\nFixture: ${fixtureId}\nAuto-approves in 45 minutes.`).catch(()=>{});
   }
   if (type === 'RESULT_APPROVED') {
-    const h = `<p>✅ Your match result has been <strong>approved</strong>!</p><p>Check the updated standings on the CEE website.</p>`;
-    const t = `✅ <b>Match result approved!</b>\nCheck the updated standings on the CEE website.`;
-    await notifyPlayer(pA,'CEE — Result Approved',h,t);
-    await notifyPlayer(pB,'CEE — Result Approved',h,t);
+    await both(
+      'CEE — Result Approved ✅',
+      `<p>✅ Your match result has been <strong>approved</strong>!</p><p>Check the updated standings on the CEE website.</p>`,
+      `✅ <b>Match result approved!</b>\nCheck the updated standings on the CEE website.`
+    );
   }
   if (type === 'DISPUTE_OPENED') {
-    const h = `<p>⚖️ A <strong>dispute</strong> has been opened for your match.</p><p>The admin will review screenshots and statements. Auto-resolves in 72 hours if admin takes no action.</p>`;
-    const t = `⚖️ <b>Dispute opened</b> for your fixture.\nAdmin will review. Auto-resolves in 72 hours.`;
-    await notifyPlayer(pA,'CEE — Dispute Opened',h,t);
-    await notifyPlayer(pB,'CEE — Dispute Opened',h,t);
-    if (adminChat) await sendTelegram(adminChat,`⚖️ <b>Dispute opened</b>\nFixture: ${fixtureId}\nRequires review within 72 hours.`);
-    if (adminEmail) await sendEmail(adminEmail,'CEE — Dispute Opened',
+    await both(
+      'CEE — Dispute Opened ⚖️',
+      `<p>⚖️ A <strong>dispute</strong> has been opened for your match.</p><p>The admin will review screenshots and statements. Auto-resolves in 72 hours if admin takes no action.</p>`,
+      `⚖️ <b>Dispute opened</b> for your fixture.\nAdmin will review. Auto-resolves in 72 hours.`
+    );
+    if (adminChat) await sendTelegram(adminChat, `⚖️ <b>Dispute opened</b>\nFixture: ${fixtureId}\nRequires review within 72 hours.`).catch(()=>{});
+    if (adminEmail) await sendEmail(adminEmail, 'CEE — Dispute Opened',
       `<p>⚖️ A dispute has been opened for fixture <strong>${fixtureId}</strong>.</p>
-       <p>Please review in the admin Disputes tab. Auto-resolves as 0–0 in 72 hours.</p>`);
+       <p>Please review in the admin Disputes tab. Auto-resolves as 0–0 in 72 hours.</p>`).catch(()=>{});
   }
   if (type === 'DISPUTE_AUTO_RESOLVED') {
-    const h = `<p>⚖️ Your dispute has been <strong>auto-resolved as a 0–0 draw</strong> after 72 hours without admin action.</p><p>The final result has been recorded. Check the CEE website for updated standings.</p>`;
-    const t = `⚖️ <b>Dispute auto-resolved</b> (72hr)\nResult: 0–0 draw. Check standings on the CEE website.`;
-    await notifyPlayer(pA,'CEE — Dispute Auto-Resolved',h,t);
-    await notifyPlayer(pB,'CEE — Dispute Auto-Resolved',h,t);
-    if (adminChat) await sendTelegram(adminChat,`⚖️ <b>Dispute auto-resolved</b> (72hr)\nFixture: ${fixtureId}\nResult: 0–0 draw`);
+    await both(
+      'CEE — Dispute Auto-Resolved ⚖️',
+      `<p>⚖️ Your dispute has been <strong>auto-resolved as a 0–0 draw</strong> after 72 hours without admin action.</p><p>The final result has been recorded.</p>`,
+      `⚖️ <b>Dispute auto-resolved</b> (72hr)\nResult: 0–0 draw. Check standings on the CEE website.`
+    );
+    if (adminChat) await sendTelegram(adminChat, `⚖️ <b>Dispute auto-resolved</b> (72hr)\nFixture: ${fixtureId}\nResult: 0–0 draw`).catch(()=>{});
   }
   if (type === 'REPLAY_SCHEDULED') {
-    const h = `<p>🔄 A <strong>replay</strong> has been scheduled for your fixture.</p><p>Check the CEE Player Hub for the new match window details.</p>`;
-    const t = `🔄 <b>Replay scheduled</b>\nCheck the CEE Player Hub for your new match window.`;
-    await notifyPlayer(pA,'CEE — Replay Scheduled',h,t);
-    await notifyPlayer(pB,'CEE — Replay Scheduled',h,t);
+    await both(
+      'CEE — Replay Scheduled 🔄',
+      `<p>🔄 A <strong>replay</strong> has been scheduled for your fixture.</p><p>Check the CEE Player Hub for the new match window details.</p>`,
+      `🔄 <b>Replay scheduled</b>\nCheck the CEE Player Hub for your new match window.`
+    );
   }
 }
 
@@ -858,68 +931,67 @@ function _generateSlots(windowOpenTime, windowCloseTime) {
 
 // Helper — notify a player about a proposal event
 async function _notifyProposal(type, targetPlayerId, fixtureId, extraData = {}) {
-  const pd = await db.collection('players').doc(targetPlayerId).get();
-  if (!pd.exists) return;
-  const p = pd.data();
   const adminChat = env.telegram && env.telegram.admin_chat_id;
 
   const fmtTime = ts => {
     if (!ts) return '?';
     const d = ts.toDate ? ts.toDate() : new Date(ts);
     return new Intl.DateTimeFormat('en-NG', {
-      timeZone:'Africa/Lagos', weekday:'short',
-      hour:'2-digit', minute:'2-digit', hour12:true
+      timeZone:'Africa/Lagos', weekday:'short', hour:'2-digit', minute:'2-digit', hour12:true
     }).format(d);
   };
 
   const msgs = {
     TIME_PROPOSED: {
-      sub: 'CEE — Match Time Proposed',
+      sub: 'CEE — Match Time Proposed ⏰',
       tg:  `⏰ <b>Match Time Proposed</b>\n\n${extraData.fromName||'Your opponent'} wants to play at:\n${(extraData.slots||[]).map((s,i)=>`  ${i+1}. ${fmtTime(s)}`).join('\n')}\n\nLog in to the CEE Player Hub to accept or counter-propose.`,
       html:`<p>⏰ <strong>${extraData.fromName||'Your opponent'}</strong> has proposed match times:</p><ul>${(extraData.slots||[]).map(s=>`<li>${fmtTime(s)}</li>`).join('')}</ul><p>Log in to the <strong>CEE Player Hub</strong> to accept one or suggest your own times.</p>`
     },
     TIME_ACCEPTED: {
       sub: 'CEE — Match Time Confirmed ✅',
-      tg:  `✅ <b>Match Time Confirmed!</b>\n\nYour match is set for <b>${fmtTime(extraData.agreedSlot)}</b>.\n\nYou'll get a reminder 1 hour before. Make sure you're on the CEE Player Hub at that time ready to Check In.`,
+      tg:  `✅ <b>Match Time Confirmed!</b>\n\nYour match is set for <b>${fmtTime(extraData.agreedSlot)}</b>.\n\nYou'll get a reminder 1 hour before. Log in to the CEE Player Hub at that time and click Check In.`,
       html:`<p>✅ Match time confirmed: <strong>${fmtTime(extraData.agreedSlot)}</strong></p><p>You'll receive a reminder 1 hour before. Log into the CEE Player Hub at that time and click <strong>Check In</strong> to start the match.</p>`
     },
     TIME_COUNTER_PROPOSED: {
-      sub: 'CEE — Counter-Proposal Received',
+      sub: 'CEE — Counter-Proposal Received 🔄',
       tg:  `🔄 <b>Counter-Proposal</b>\n\n${extraData.fromName||'Your opponent'} suggests:\n${(extraData.slots||[]).map((s,i)=>`  ${i+1}. ${fmtTime(s)}`).join('\n')}\n\nLog in to the CEE Player Hub to respond.`,
       html:`<p>🔄 <strong>${extraData.fromName||'Your opponent'}</strong> has counter-proposed:</p><ul>${(extraData.slots||[]).map(s=>`<li>${fmtTime(s)}</li>`).join('')}</ul><p>Log in to the <strong>CEE Player Hub</strong> to accept or make a final proposal.</p>`
     },
     CHECKIN_REMINDER_1H: {
       sub: 'CEE — Match in 1 Hour ⚡',
-      tg:  `⚡ <b>Match in 1 hour!</b>\n\nYour agreed match time is <b>${fmtTime(extraData.agreedSlot)}</b>.\n\nMake sure you're free and ready. You'll need to click Check In on the CEE Player Hub when the window opens.`,
+      tg:  `⚡ <b>Match in 1 hour!</b>\n\nAgreed time: <b>${fmtTime(extraData.agreedSlot)}</b>.\n\nMake sure you're free and ready. Click Check In on the CEE Player Hub when the time arrives.`,
       html:`<p>⚡ Your match is in <strong>1 hour</strong> — agreed time: <strong>${fmtTime(extraData.agreedSlot)}</strong></p><p>Be ready on the CEE Player Hub to click Check In.</p>`
     },
     CHECKIN_REMINDER_15M: {
-      sub: 'CEE — Match Starting Soon 🎮',
-      tg:  `🎮 <b>Match starting in 15 minutes!</b>\n\nGet your console ready. The Check In button will appear on the CEE Player Hub at <b>${fmtTime(extraData.agreedSlot)}</b>.`,
+      sub: 'CEE — Match Starting Soon! 🎮',
+      tg:  `🎮 <b>Match in 15 minutes!</b>\n\nGet your console ready. The Check In button goes live at <b>${fmtTime(extraData.agreedSlot)}</b> on the CEE Player Hub.`,
       html:`<p>🎮 <strong>15 minutes</strong> until your match! Get your console ready.</p><p>The Check In button goes live at <strong>${fmtTime(extraData.agreedSlot)}</strong>.</p>`
     },
     CHECKIN_OPEN: {
-      sub: 'CEE — Check In Now! 🟢',
-      tg:  `🟢 <b>Check In NOW!</b>\n\nYour match window is live. Log in to the CEE Player Hub and click <b>Check In</b> within the next 20 minutes.`,
-      html:`<p>🟢 <strong>Your match is live!</strong> Log into the CEE Player Hub and click <strong>Check In</strong> within the next 20 minutes.</p>`
+      sub: 'CEE — Check In NOW! 🟢',
+      tg:  `🟢 <b>CHECK IN NOW!</b>\n\nYour agreed match time is here. Log in to the CEE Player Hub and tap <b>Check In</b> within the next 20 minutes or the match may be forfeited.`,
+      html:`<p>🟢 <strong>Your match time is NOW!</strong> Log into the CEE Player Hub and click <strong>Check In</strong> within the next 20 minutes.</p>`
     },
     ADMIN_ARBITRATION: {
-      sub: 'CEE — Match Scheduling Needs Admin Review',
-      tg:  `⚖️ <b>Arbitration needed</b>\n\nFixture ${fixtureId} — players could not agree on a match time after 2 rounds of proposals.\n\nPlease review and assign a time manually.`,
-      html:null
+      sub: 'CEE — Match Scheduling: Admin Review Needed',
+      tg:  `⚖️ <b>Admin arbitration triggered</b>\n\nFixture ${fixtureId} — players could not agree on a match time after 2 proposal rounds.\n\nPlease review and assign a time manually in the admin panel.`,
+      html: `<p>⚖️ Fixture <strong>${fixtureId}</strong> needs admin arbitration. Players exhausted 2 proposal rounds without agreeing.</p><p>Please log in to the admin panel and assign a match time manually.</p>`
     }
   };
 
   const m = msgs[type];
   if (!m) return;
-  if (p.email && p.notificationsEmail !== false && m.html)
-    await sendEmail(p.email, m.sub, m.html).catch(()=>{});
-  if (p.telegramChatId && p.notificationsTelegram !== false)
-    await sendTelegram(p.telegramChatId, m.tg).catch(()=>{});
-  if (type === 'ADMIN_ARBITRATION' && adminChat)
-    await sendTelegram(adminChat, m.tg).catch(()=>{});
-  await logNotif(fixtureId, targetPlayerId, 'both', type, 'sent', null,
-    { messageText: m.tg, emailSubject: m.sub }).catch(()=>{});
+
+  // Admin-only event
+  if (type === 'ADMIN_ARBITRATION') {
+    if (adminChat) await sendTelegram(adminChat, m.tg).catch(()=>{});
+    const adminEmail = env.admin && env.admin.email;
+    if (adminEmail && m.html) await sendEmail(adminEmail, m.sub, m.html).catch(()=>{});
+    return;
+  }
+
+  // Player notification — goes through all channels they have
+  await _notifyPlayer(targetPlayerId, fixtureId, type, m.sub, m.html, m.tg);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1479,40 +1551,50 @@ app.post('/unblockPlayer', async (req, res) => {
 });
 app.post('/sendNotification', async (req, res) => {
   if (!assertAdminSecret(req,res)) return;
-  // Accepts: { playerIds: 'all' | string[] | string, message, channel, eventType }
-  // playerIds can be player doc IDs OR raw Telegram chatIds (numeric strings)
   const { playerIds, recipientId, message, channel, eventType } = req.body;
-  const target = playerIds || recipientId; // support both field names
-  const subj = `CEE — ${(eventType||'Notification').replace(/_/g,' ')}`;
-  const html = `<p>${message.replace(/\n/g,'<br>')}</p>`;
-  const doEmail = !channel || channel === 'email' || channel === 'both';
-  const doTelegram = !channel || channel === 'telegram' || channel === 'both';
+  const target = playerIds || recipientId;
+  const subj   = `CEE — ${(eventType||'Notification').replace(/_/g,' ')}`;
+  const html   = `<p>${message.replace(/\n/g,'<br>')}</p>`;
+
   try {
+    let recipients = []; // array of player doc IDs
+
     if (target === 'all') {
       const sid = await getSeasonId();
-      const players = sid ? await getPlayers(sid) : [];
-      for (const p of players) {
-        if (doEmail && p.email && p.notificationsEmail !== false) await sendEmail(p.email, subj, html);
-        if (doTelegram && p.telegramChatId && p.notificationsTelegram !== false) await sendTelegram(p.telegramChatId, message);
+      if (sid) {
+        const snap = await db.collection('players').where('seasonId','==',sid).get();
+        snap.forEach(d => recipients.push(d.id));
       }
     } else {
-      // Normalise to array
-      const ids = Array.isArray(target) ? target : (target ? [target] : []);
+      const ids = Array.isArray(target) ? target : (target ? [String(target)] : []);
+      // Separate raw Telegram chat IDs (all digits) from Firestore player IDs
       for (const id of ids) {
-        // If id looks like a Telegram chatId (all digits, possibly negative), send direct
-        if (/^-?\d+$/.test(String(id))) {
-          if (doTelegram) await sendTelegram(String(id), message);
+        if (/^-?\d+$/.test(id)) {
+          // Raw Telegram chat ID — send direct, skip player lookup
+          if (!channel || channel === 'telegram' || channel === 'both')
+            await sendTelegram(id, message).catch(()=>{});
         } else {
-          // It's a Firestore player doc ID
-          const pd = await db.collection('players').doc(String(id)).get();
-          if (pd.exists) {
-            const p = pd.data();
-            if (doEmail && p.email && p.notificationsEmail !== false) await sendEmail(p.email, subj, html);
-            if (doTelegram && p.telegramChatId && p.notificationsTelegram !== false) await sendTelegram(p.telegramChatId, message);
-          }
+          recipients.push(id);
         }
       }
     }
+
+    // For Firestore player IDs, use _notifyPlayer so all channels fire
+    for (const pid of recipients) {
+      const doEmail    = !channel || channel === 'email'    || channel === 'both';
+      const doTelegram = !channel || channel === 'telegram' || channel === 'both';
+      // Override the per-player preference check for manual admin sends
+      const snap = await db.collection('players').doc(pid).get();
+      if (!snap.exists) continue;
+      const p = snap.data();
+      if (doTelegram && p.telegramChatId) await sendTelegram(p.telegramChatId, message).catch(()=>{});
+      if (doEmail    && p.email)          await sendEmail(p.email, subj, html).catch(()=>{});
+      // Always queue WhatsApp relay for admin-sent notifications
+      if (p.whatsappNumber) await _queueWhatsAppRelay(null, pid, p, message).catch(()=>{});
+      await logNotif(null, pid, channel||'both', eventType||'MANUAL', 'sent', null,
+        { messageText: message, emailSubject: subj }).catch(()=>{});
+    }
+
     return res.json({ success: true });
   } catch(e) { return res.status(500).json({ success: false, message: e.message }); }
 });
@@ -1582,11 +1664,106 @@ app.post('/retryAllFailed', async (req, res) => {
 
 app.post('/testNotification', async (req, res) => {
   if (!assertAdminSecret(req,res)) return;
+  const results = { email: null, telegram: null };
+
+  // ── Email ──────────────────────────────────────────────────────────────
   try {
-    await sendEmail(env.admin.email,'CEE — Test Notification','<p>✅ Email notifications are working correctly.</p>');
-    if (env.telegram&&env.telegram.admin_chat_id) await sendTelegram(env.telegram.admin_chat_id,'✅ CEE Telegram test — working!');
-    return res.json({ success:true, message:'Test notifications sent.' });
-  } catch(e){ return res.status(500).json({ success:false, message:e.message }); }
+    if (!env.gmail || !env.gmail.user || !env.gmail.pass) {
+      results.email = { ok:false, error:'GMAIL_USER or GMAIL_PASS not set in Railway environment variables.' };
+    } else {
+      const t = getTransporter();
+      await t.verify(); // actually tests the SMTP connection
+      const info = await sendEmail(env.admin.email || env.gmail.user,
+        'CEE — Test Email ✅',
+        '<p>✅ Gmail SMTP is working correctly. Your email notifications are operational.</p>'
+      );
+      results.email = { ok: true, to: env.admin.email || env.gmail.user, messageId: info.messageId };
+    }
+  } catch(e) {
+    results.email = { ok: false, error: e.message };
+  }
+
+  // ── Telegram ───────────────────────────────────────────────────────────
+  try {
+    if (!env.telegram || !env.telegram.token) {
+      results.telegram = { ok:false, error:'TELEGRAM_TOKEN not set in Railway environment variables.' };
+    } else if (!env.telegram.admin_chat_id) {
+      results.telegram = { ok:false, error:'TELEGRAM_ADMIN_CHAT_ID not set in Railway environment variables.' };
+    } else {
+      const r = await sendTelegram(env.telegram.admin_chat_id,
+        '✅ <b>CEE Telegram Test</b>\n\nYour Telegram notifications are working correctly.'
+      );
+      if (r && r.ok) {
+        results.telegram = { ok:true, chat_id:env.telegram.admin_chat_id };
+      } else {
+        results.telegram = { ok:false, error: (r && r.description) || 'Telegram API returned an error. Check TELEGRAM_TOKEN is valid.' };
+      }
+    }
+  } catch(e) {
+    results.telegram = { ok:false, error:e.message };
+  }
+
+  const allOk = results.email.ok && results.telegram.ok;
+  return res.json({ success: allOk, results });
+});
+
+// GET /diagnoseNotifications — checks all channels without sending, returns full config status
+app.get('/diagnoseNotifications', async (req, res) => {
+  if (!assertAdminSecret(req,res)) return;
+  const diag = {
+    email: {
+      configured: !!(env.gmail && env.gmail.user && env.gmail.pass),
+      user: env.gmail && env.gmail.user ? env.gmail.user : null,
+      passLength: env.gmail && env.gmail.pass ? env.gmail.pass.length : 0,
+      // Gmail App Passwords are exactly 16 chars. Regular passwords are usually longer.
+      passLooksLikeAppPassword: env.gmail && env.gmail.pass ? env.gmail.pass.replace(/\s/g,'').length === 16 : false,
+      adminEmailSet: !!(env.admin && env.admin.email)
+    },
+    telegram: {
+      tokenConfigured: !!(env.telegram && env.telegram.token),
+      adminChatIdSet:  !!(env.telegram && env.telegram.admin_chat_id),
+      // Safe preview of token format (first 8 chars only)
+      tokenPreview: env.telegram && env.telegram.token
+        ? env.telegram.token.substring(0,8) + '...'
+        : null
+    },
+    whatsapp: {
+      note: 'WhatsApp notifications use the admin as a relay. Players with whatsappNumber set will have messages queued in the notification log for admin to forward.'
+    }
+  };
+
+  // Check how many players have each channel configured
+  try {
+    const sid = await getSeasonId();
+    if (sid) {
+      const players = await getPlayers(sid);
+      diag.players = {
+        total: players.length,
+        withEmail: players.filter(p=>p.email).length,
+        withTelegram: players.filter(p=>p.telegramChatId).length,
+        withWhatsapp: players.filter(p=>p.whatsappNumber).length,
+        emailOptedOut: players.filter(p=>p.notificationsEmail===false).length,
+        telegramOptedOut: players.filter(p=>p.notificationsTelegram===false).length
+      };
+    }
+  } catch(e) { diag.playersError = e.message; }
+
+  // Suggestions
+  diag.suggestions = [];
+  if (!diag.email.configured)
+    diag.suggestions.push('Set GMAIL_USER and GMAIL_PASS in Railway → Variables → New Variable');
+  if (diag.email.configured && !diag.email.passLooksLikeAppPassword)
+    diag.suggestions.push('GMAIL_PASS looks wrong — Gmail App Passwords are exactly 16 characters (no spaces). Generate one at myaccount.google.com → Security → 2-Step Verification → App Passwords');
+  if (!diag.telegram.tokenConfigured)
+    diag.suggestions.push('Set TELEGRAM_TOKEN in Railway → Variables (get it from @BotFather on Telegram)');
+  if (!diag.telegram.adminChatIdSet)
+    diag.suggestions.push('Set TELEGRAM_ADMIN_CHAT_ID in Railway — this is YOUR personal Telegram chat ID (send /start to @userinfobot to find it)');
+  if (diag.players && diag.players.withTelegram === 0)
+    diag.suggestions.push('No players have linked Telegram. Since your players use WhatsApp, use the WhatsApp relay in the notification log to manually forward messages, or ask players to link Telegram in the Player Hub.');
+  if (diag.players && diag.players.withWhatsapp === 0 && diag.players.total > 0)
+    diag.suggestions.push('No players have a WhatsApp number saved. Add whatsappNumber to player profiles so the admin relay can generate direct wa.me links.');
+
+  return res.json({ ok: true, diag });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
