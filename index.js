@@ -36,7 +36,15 @@ const bcrypt       = require('bcrypt');
 const fetch        = require('node-fetch');
 
 // ── Firebase Admin init ───────────────────────────────────────────────────
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
+let serviceAccount;
+try {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT || '{}';
+  serviceAccount = JSON.parse(raw);
+} catch(e) {
+  console.error('[CEE] FATAL: FIREBASE_SERVICE_ACCOUNT is not valid JSON:', e.message);
+  console.error('[CEE] Make sure the value in Railway has no line breaks and is a single-line JSON string.');
+  serviceAccount = {};
+}
 admin.initializeApp({
   credential:    admin.credential.cert(serviceAccount),
   storageBucket: process.env.FIREBASE_STORAGE_BUCKET || ''
@@ -206,6 +214,12 @@ _initVapid();
 
 // ── Express app ───────────────────────────────────────────────────────────
 const app = express();
+// Handle CORS preflight for ALL routes (must be before any route definitions)
+app.options('*', corsMidd({
+  origin: '*',
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','x-cee-admin-secret']
+}));
 app.use(corsMidd({
   origin: '*',
   methods: ['GET','POST','OPTIONS'],
@@ -3312,7 +3326,30 @@ db.collection('registrations').onSnapshot(snapshot => {
 // ═══════════════════════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`[CEE] Backend running on port ${PORT}`);
+  console.log(`[CEE] ✅ Backend running on port ${PORT}`);
+  console.log(`[CEE] URL: https://campus-esports-elite-backend2-production.up.railway.app`);
+  // Startup env check — show what's configured and what's missing
+  const checks = {
+    'FIREBASE_SERVICE_ACCOUNT': !!(serviceAccount && serviceAccount.project_id),
+    'FIREBASE_STORAGE_BUCKET':  !!process.env.FIREBASE_STORAGE_BUCKET,
+    'GMAIL_USER':               !!process.env.GMAIL_USER,
+    'GMAIL_PASS':               !!(process.env.GMAIL_PASS && process.env.GMAIL_PASS.replace(/\s/g,'').length === 16),
+    'TELEGRAM_TOKEN':           !!process.env.TELEGRAM_TOKEN,
+    'TELEGRAM_ADMIN_CHAT_ID':   !!process.env.TELEGRAM_ADMIN_CHAT_ID,
+    'ADMIN_SECRET':             !!process.env.ADMIN_SECRET,
+    'ADMIN_EMAIL':              !!process.env.ADMIN_EMAIL,
+    'PAYSTACK_SECRET':          !!process.env.PAYSTACK_SECRET,
+    'GEMINI_KEY':               !!process.env.GEMINI_KEY,
+    'VAPID_PUBLIC_KEY':         !!process.env.VAPID_PUBLIC_KEY,
+    'VAPID_PRIVATE_KEY':        !!process.env.VAPID_PRIVATE_KEY,
+  };
+  const ok  = Object.entries(checks).filter(([,v]) => v).map(([k]) => k);
+  const bad = Object.entries(checks).filter(([,v]) => !v).map(([k]) => k);
+  if (ok.length)  console.log('[CEE] ✅ Env OK:      ', ok.join(', '));
+  if (bad.length) console.log('[CEE] ❌ Env MISSING: ', bad.join(', '));
+  if (serviceAccount && !serviceAccount.project_id) {
+    console.error('[CEE] ⚠️  FIREBASE_SERVICE_ACCOUNT parsed but has no project_id — check it is the full service account JSON, not a partial value.');
+  }
   console.log('[CEE] Scheduled jobs active: windowManager(15m), submissionDeadlineEnforcer(10m),');
   console.log('[CEE]   autoApprover(5m), disputeAutoResolver(30m), doubleConsentExpiryEnforcer(30m),');
   console.log('[CEE]   swissPairingEngine(6h), registrationDeadlineChecker(daily),');
