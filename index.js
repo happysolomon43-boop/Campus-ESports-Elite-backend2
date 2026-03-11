@@ -57,6 +57,142 @@ const env = {
   paystack: { secret:        process.env.PAYSTACK_SECRET }
 };
 
+// ── VAPID / Web Push ──────────────────────────────────────────────────────
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || '';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
+const VAPID_SUBJECT     = `mailto:${process.env.ADMIN_EMAIL || 'admin@cee.app'}`;
+
+let _vapidPrivKeyObj = null;
+let _vapidPubKeyBuf  = null;
+
+function _initVapid() {
+  if (_vapidPrivKeyObj) return true;
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+    console.warn('[CEE] VAPID keys not set — web push disabled. Set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY in Railway.');
+    return false;
+  }
+  try {
+    _vapidPubKeyBuf = Buffer.from(VAPID_PUBLIC_KEY, 'base64url');
+    // Extract x and y from the 65-byte uncompressed EC point (skip 0x04 prefix)
+    const x = _vapidPubKeyBuf.slice(1, 33).toString('base64url');
+    const y = _vapidPubKeyBuf.slice(33, 65).toString('base64url');
+    _vapidPrivKeyObj = crypto.createPrivateKey({
+      key: { kty: 'EC', crv: 'P-256', d: VAPID_PRIVATE_KEY, x, y },
+      format: 'jwk'
+    });
+    console.log('[CEE] VAPID initialized — web push enabled.');
+    return true;
+  } catch(e) {
+    console.error('[CEE] VAPID init failed:', e.message);
+    return false;
+  }
+}
+
+// HKDF helpers (RFC 5869)
+function _hkdfExtract(salt, ikm) {
+  return crypto.createHmac('sha256', salt).update(ikm).digest();
+}
+function _hkdfExpand(prk, info, len) {
+  const chunks = [];
+  let T = Buffer.alloc(0);
+  for (let i = 1; chunks.reduce((a, c) => a + c.length, 0) < len; i++) {
+    T = crypto.createHmac('sha256', prk).update(Buffer.concat([T, info, Buffer.from([i])])).digest();
+    chunks.push(T);
+  }
+  return Buffer.concat(chunks).slice(0, len);
+}
+
+// Build VAPID JWT (RFC 8292)
+function _vapidJwt(endpoint) {
+  const url      = new URL(endpoint);
+  const audience = `${url.protocol}//${url.host}`;
+  const exp      = Math.floor(Date.now() / 1000) + 43200; // 12h
+  const header   = Buffer.from(JSON.stringify({ typ:'JWT', alg:'ES256' })).toString('base64url');
+  const payload  = Buffer.from(JSON.stringify({ aud:audience, exp, sub:VAPID_SUBJECT })).toString('base64url');
+  const input    = `${header}.${payload}`;
+  // ieee-p1363 encoding gives raw r||s (64 bytes) — what JWT ES256 expects
+  const sig = crypto.sign(null, Buffer.from(input), { key: _vapidPrivKeyObj, dsaEncoding: 'ieee-p1363' });
+  return `${input}.${sig.toString('base64url')}`;
+}
+
+// Encrypt push payload (RFC 8291 — aes128gcm)
+function _encryptPushPayload(payloadStr, subscription) {
+  const recipPubBuf = Buffer.from(subscription.keys.p256dh, 'base64url'); // 65 bytes uncompressed
+  const authBuf     = Buffer.from(subscription.keys.auth,   'base64url'); // 16 bytes
+
+  // Random 16-byte salt
+  const salt = crypto.randomBytes(16);
+
+  // Ephemeral sender key pair
+  const senderPair = crypto.generateKeyPairSync('ec', {
+    namedCurve: 'prime256v1',
+    publicKeyEncoding:  { type:'spki',  format:'der' },
+    privateKeyEncoding: { type:'pkcs8', format:'der' }
+  });
+  // Raw 65-byte sender public key = last 65 bytes of the SPKI DER
+  const senderPubRaw = senderPair.publicKey.slice(-65);
+  const senderPrivObj = crypto.createPrivateKey({ key:senderPair.privateKey, format:'der', type:'pkcs8' });
+
+  // Import recipient public key into a Node crypto key object via SPKI DER
+  const spkiHdr     = Buffer.from('3059301306072a8648ce3d020106082a8648ce3d030107034200', 'hex');
+  const recipPubObj = crypto.createPublicKey({ key:Buffer.concat([spkiHdr, recipPubBuf]), format:'der', type:'spki' });
+
+  // ECDH shared secret
+  const ecdhSecret = crypto.diffieHellman({ privateKey:senderPrivObj, publicKey:recipPubObj });
+
+  // IKM derivation (RFC 8291 §3.3)
+  const ikmInfo = Buffer.concat([Buffer.from('WebPush: info\0','ascii'), recipPubBuf, senderPubRaw]);
+  const prkKey  = _hkdfExtract(authBuf, ecdhSecret);
+  const ikm     = _hkdfExpand(prkKey, ikmInfo, 32);
+
+  // Derive CEK (16 bytes) and nonce (12 bytes)
+  const prk   = _hkdfExtract(salt, ikm);
+  const cek   = _hkdfExpand(prk, Buffer.from('Content-Encoding: aes128gcm\0','ascii'), 16);
+  const nonce = _hkdfExpand(prk, Buffer.from('Content-Encoding: nonce\0','ascii'), 12);
+
+  // AES-128-GCM encrypt: plaintext || 0x02 (last-record delimiter)
+  const cipher    = crypto.createCipheriv('aes-128-gcm', cek, nonce);
+  const encrypted = Buffer.concat([
+    cipher.update(Buffer.concat([Buffer.from(payloadStr, 'utf8'), Buffer.from([0x02])])),
+    cipher.final()
+  ]);
+  const tag = cipher.getAuthTag(); // 16 bytes
+
+  // RFC 8291 §4 body: salt(16) || rs(4,BE) || keylen(1) || senderPub(65) || ciphertext || tag
+  const rs = Buffer.alloc(4); rs.writeUInt32BE(4096);
+  return Buffer.concat([salt, rs, Buffer.from([65]), senderPubRaw, encrypted, tag]);
+}
+
+// Send a single Web Push notification
+async function _sendWebPush(subscription, notifPayload) {
+  if (!_initVapid()) return { ok:false, error:'VAPID not configured' };
+  if (!subscription || !subscription.endpoint || !subscription.keys) return { ok:false, error:'Invalid subscription' };
+  try {
+    const jwt  = _vapidJwt(subscription.endpoint);
+    const body = _encryptPushPayload(JSON.stringify(notifPayload), subscription);
+    const res  = await fetch(subscription.endpoint, {
+      method:  'POST',
+      headers: {
+        'Content-Type':     'application/octet-stream',
+        'Content-Encoding': 'aes128gcm',
+        'Authorization':    `vapid t=${jwt},k=${VAPID_PUBLIC_KEY}`,
+        'TTL':              '86400',
+        'Urgency':          notifPayload.urgency || 'normal'
+      },
+      body
+    });
+    if (res.status === 201 || res.status === 200) return { ok:true };
+    if (res.status === 410 || res.status === 404) return { ok:false, expired:true };
+    const txt = await res.text().catch(()=>'');
+    return { ok:false, error:`Push server: ${res.status} ${txt}` };
+  } catch(e) {
+    return { ok:false, error:e.message };
+  }
+}
+
+// Initialise VAPID at server startup
+_initVapid();
+
 // ── Startup config validation ─────────────────────────────────────────────
 (function _validateConfig() {
   const required = ['GEMINI_KEY','GMAIL_USER','GMAIL_PASS','TELEGRAM_TOKEN',
@@ -248,7 +384,7 @@ async function _notifyPlayer(pid, fixtureId, eventType, subject, htmlBody, tgTex
   const snap = await db.collection('players').doc(pid).get();
   if (!snap.exists) return;
   const p = { id: pid, ...snap.data() };
-  const results = { telegram: null, email: null, whatsapp: null };
+  const results = { telegram: null, email: null, whatsapp: null, push: null };
 
   // Telegram
   if (p.telegramChatId && p.notificationsTelegram !== false) {
@@ -264,6 +400,34 @@ async function _notifyPlayer(pid, fixtureId, eventType, subject, htmlBody, tgTex
     if (!r.success) console.warn(`[CEE] Email failed for ${pid}:`, r.error);
   }
 
+  // Web Push — fire for every player who has subscribed, if they haven't disabled it
+  if (p.pushSubscription && p.notificationsPush !== false) {
+    let sub;
+    try { sub = typeof p.pushSubscription === 'string' ? JSON.parse(p.pushSubscription) : p.pushSubscription; }
+    catch(e) { sub = null; }
+    if (sub) {
+      // Strip HTML tags for the push body
+      const pushBody = tgText.replace(/<[^>]+>/g, '').replace(/\n{3,}/g, '\n\n').trim();
+      const r = await _sendWebPush(sub, {
+        title:     '⚡ CEE — Campus eSports Elite',
+        body:      pushBody.substring(0, 200),
+        eventType,
+        fixtureId: fixtureId || null,
+        urgency:   ['CHECKIN_OPEN','CHECKIN_REMINDER_15M','CHECK_IN_NOW'].includes(eventType) ? 'high' : 'normal',
+        data:      { url: `${process.env.SITE_URL || 'https://cee-esports.web.app'}#hub` }
+      });
+      results.push = r.ok ? 'sent' : 'failed';
+      if (!r.ok) {
+        console.warn(`[CEE] Web push failed for ${pid}:`, r.error);
+        // If subscription expired/gone, clean it up from Firestore
+        if (r.expired) {
+          db.collection('players').doc(pid).update({ pushSubscription: admin.firestore.FieldValue.delete() }).catch(()=>{});
+          console.log(`[CEE] Removed expired push subscription for ${pid}`);
+        }
+      }
+    }
+  }
+
   // WhatsApp relay — always queue if player has a number, regardless of other channels
   if (p.whatsappNumber) {
     await _queueWhatsAppRelay(fixtureId, pid, p, tgText);
@@ -274,6 +438,7 @@ async function _notifyPlayer(pid, fixtureId, eventType, subject, htmlBody, tgTex
   const channel = [
     results.telegram && 'telegram',
     results.email    && 'email',
+    results.push     && 'push',
     results.whatsapp && 'whatsapp'
   ].filter(Boolean).join('+') || 'none';
 
@@ -1549,6 +1714,87 @@ app.post('/unblockPlayer', async (req, res) => {
     return res.json({ success: true, message: 'Player unblocked and new PIN emailed.' });
   } catch(e) { return res.status(500).json({ success: false, message: e.message }); }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /vapidPublicKey — frontend calls this once on load to get the VAPID key
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/vapidPublicKey', (req, res) => {
+  if (!VAPID_PUBLIC_KEY) return res.json({ ok: false, message: 'Web push not configured on this server.' });
+  res.json({ ok: true, publicKey: VAPID_PUBLIC_KEY });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /savePushSubscription — called after browser subscribe(), saves to Firestore
+// Body: { playerId, subscription: { endpoint, keys: { p256dh, auth } } }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/savePushSubscription', async (req, res) => {
+  const { playerId, subscription } = req.body;
+  if (!playerId || !subscription || !subscription.endpoint || !subscription.keys)
+    return res.status(400).json({ ok: false, message: 'playerId and subscription required.' });
+  try {
+    await db.collection('players').doc(String(playerId)).update({
+      pushSubscription:   JSON.stringify(subscription),
+      notificationsPush:  true,
+      pushSubscribedAt:   admin.firestore.FieldValue.serverTimestamp()
+    });
+    console.log(`[CEE] Push subscription saved for ${playerId}`);
+    return res.json({ ok: true });
+  } catch(e) {
+    console.error('[CEE] savePushSubscription error:', e.message);
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /deletePushSubscription — called when player turns off push in hub
+// Body: { playerId }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/deletePushSubscription', async (req, res) => {
+  const { playerId } = req.body;
+  if (!playerId) return res.status(400).json({ ok: false, message: 'playerId required.' });
+  try {
+    await db.collection('players').doc(String(playerId)).update({
+      pushSubscription:  admin.firestore.FieldValue.delete(),
+      notificationsPush: false
+    });
+    return res.json({ ok: true });
+  } catch(e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /testPushNotification — sends a live test push to a specific player
+// Body: { playerId } — admin only
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/testPushNotification', async (req, res) => {
+  if (!assertAdminSecret(req, res)) return;
+  const { playerId } = req.body;
+  if (!playerId) return res.status(400).json({ ok: false, message: 'playerId required.' });
+  try {
+    const snap = await db.collection('players').doc(String(playerId)).get();
+    if (!snap.exists) return res.json({ ok: false, message: 'Player not found.' });
+    const p = snap.data();
+    if (!p.pushSubscription) return res.json({ ok: false, message: 'Player has no push subscription saved.' });
+    let sub;
+    try { sub = typeof p.pushSubscription === 'string' ? JSON.parse(p.pushSubscription) : p.pushSubscription; }
+    catch(e) { return res.json({ ok: false, message: 'Subscription data corrupt.' }); }
+    const r = await _sendWebPush(sub, {
+      title: '🧪 CEE Push Test',
+      body:  'Web push is working! You\'ll get match notifications here.',
+      eventType: 'TEST',
+      data: { url: `${process.env.SITE_URL || 'https://cee-esports.web.app'}#hub` }
+    });
+    if (!r.ok && r.expired) {
+      await db.collection('players').doc(String(playerId)).update({ pushSubscription: admin.firestore.FieldValue.delete() }).catch(()=>{});
+      return res.json({ ok: false, message: 'Subscription expired — player needs to re-enable push notifications.' });
+    }
+    return res.json(r);
+  } catch(e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
 app.post('/sendNotification', async (req, res) => {
   if (!assertAdminSecret(req,res)) return;
   const { playerIds, recipientId, message, channel, eventType } = req.body;
@@ -1715,40 +1961,41 @@ app.get('/diagnoseNotifications', async (req, res) => {
       configured: !!(env.gmail && env.gmail.user && env.gmail.pass),
       user: env.gmail && env.gmail.user ? env.gmail.user : null,
       passLength: env.gmail && env.gmail.pass ? env.gmail.pass.length : 0,
-      // Gmail App Passwords are exactly 16 chars. Regular passwords are usually longer.
       passLooksLikeAppPassword: env.gmail && env.gmail.pass ? env.gmail.pass.replace(/\s/g,'').length === 16 : false,
       adminEmailSet: !!(env.admin && env.admin.email)
     },
     telegram: {
       tokenConfigured: !!(env.telegram && env.telegram.token),
       adminChatIdSet:  !!(env.telegram && env.telegram.admin_chat_id),
-      // Safe preview of token format (first 8 chars only)
-      tokenPreview: env.telegram && env.telegram.token
-        ? env.telegram.token.substring(0,8) + '...'
-        : null
+      tokenPreview: env.telegram && env.telegram.token ? env.telegram.token.substring(0,8) + '...' : null
     },
     whatsapp: {
       note: 'WhatsApp notifications use the admin as a relay. Players with whatsappNumber set will have messages queued in the notification log for admin to forward.'
+    },
+    webPush: {
+      vapidConfigured: !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY),
+      publicKeyPreview: VAPID_PUBLIC_KEY ? VAPID_PUBLIC_KEY.substring(0, 12) + '...' : null,
+      note: 'Players must visit the site and click "Enable Push Notifications" in their Player Hub to subscribe.'
     }
   };
 
-  // Check how many players have each channel configured
   try {
     const sid = await getSeasonId();
     if (sid) {
       const players = await getPlayers(sid);
       diag.players = {
-        total: players.length,
-        withEmail: players.filter(p=>p.email).length,
-        withTelegram: players.filter(p=>p.telegramChatId).length,
-        withWhatsapp: players.filter(p=>p.whatsappNumber).length,
-        emailOptedOut: players.filter(p=>p.notificationsEmail===false).length,
-        telegramOptedOut: players.filter(p=>p.notificationsTelegram===false).length
+        total:            players.length,
+        withEmail:        players.filter(p=>p.email).length,
+        withTelegram:     players.filter(p=>p.telegramChatId).length,
+        withWhatsapp:     players.filter(p=>p.whatsappNumber).length,
+        withPush:         players.filter(p=>p.pushSubscription).length,
+        emailOptedOut:    players.filter(p=>p.notificationsEmail===false).length,
+        telegramOptedOut: players.filter(p=>p.notificationsTelegram===false).length,
+        pushOptedOut:     players.filter(p=>p.notificationsPush===false).length
       };
     }
   } catch(e) { diag.playersError = e.message; }
 
-  // Suggestions
   diag.suggestions = [];
   if (!diag.email.configured)
     diag.suggestions.push('Set GMAIL_USER and GMAIL_PASS in Railway → Variables → New Variable');
@@ -1758,10 +2005,10 @@ app.get('/diagnoseNotifications', async (req, res) => {
     diag.suggestions.push('Set TELEGRAM_TOKEN in Railway → Variables (get it from @BotFather on Telegram)');
   if (!diag.telegram.adminChatIdSet)
     diag.suggestions.push('Set TELEGRAM_ADMIN_CHAT_ID in Railway — this is YOUR personal Telegram chat ID (send /start to @userinfobot to find it)');
-  if (diag.players && diag.players.withTelegram === 0)
-    diag.suggestions.push('No players have linked Telegram. Since your players use WhatsApp, use the WhatsApp relay in the notification log to manually forward messages, or ask players to link Telegram in the Player Hub.');
-  if (diag.players && diag.players.withWhatsapp === 0 && diag.players.total > 0)
-    diag.suggestions.push('No players have a WhatsApp number saved. Add whatsappNumber to player profiles so the admin relay can generate direct wa.me links.');
+  if (!diag.webPush.vapidConfigured)
+    diag.suggestions.push('Set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY in Railway to enable web push notifications — these were generated for you, check the session notes.');
+  if (diag.players && diag.players.withPush === 0 && diag.webPush.vapidConfigured)
+    diag.suggestions.push('VAPID is configured but no players have subscribed yet. They need to click "Enable Push Notifications" in the Player Hub Settings tab.');
 
   return res.json({ ok: true, diag });
 });
