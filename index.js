@@ -1688,9 +1688,33 @@ app.post('/submitScore', async (req, res) => {
         body:JSON.stringify({
           contents:[{parts:[
             {inline_data:{mime_type:mediaType||'image/jpeg',data:imageData}},
-            {text:`You are analyzing an eFootball (soccer video game) post-match result screen.\nRespond ONLY in JSON, no other text, no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<club name or null>",\n  "awayClubName": "<club name or null>",\n  "isPlausibleScore": true/false,\n  "confidence": <float 0.0-1.0>\n}\nRules:\n- isEfootballResultScreen: true only if clearly eFootball post-match result screen\n- isFullResultScreen: true only if shows complete final result\n- homeGoals/awayGoals: final score integers, null if not readable\n- isPlausibleScore: false if GD>=10 or either score>20\n- confidence: 1.0=certain, 0.0=cannot read\n- Set all false/null/0.0 if not eFootball result screen`}
+            {text:`You are analyzing a screenshot from eFootball (Konami's soccer video game). Your job is to determine if it shows a FINAL post-match result screen with the completed score.
+
+VALID result screens show: final score prominently displayed, both club names/badges, "RESULT" text or post-match stats screen, full-time summary.
+
+NOT valid result screens: pause menu (shows Game Plan/Camera/Audio/Quit options), half-time screen, pre-match lobby, in-game HUD, any mid-game screen, or non-eFootball images.
+
+Respond ONLY in JSON with no extra text or markdown:
+{
+  "isEfootballResultScreen": true/false,
+  "isFullResultScreen": true/false,
+  "homeGoals": <integer or null>,
+  "awayGoals": <integer or null>,
+  "homeClubName": "<club name string or null>",
+  "awayClubName": "<club name string or null>",
+  "isPlausibleScore": true/false,
+  "confidence": <float 0.0-1.0>,
+  "screenType": "<what type of screen this is e.g. 'post-match result', 'pause menu', 'half-time', 'pre-match', 'non-efootball', etc.>"
+}
+Rules:
+- isEfootballResultScreen: true ONLY if this is clearly the eFootball post-match RESULT/summary screen after the match has fully ended
+- isFullResultScreen: true only if the complete final score is clearly readable
+- homeGoals/awayGoals: exact integers from the final score, null if not a result screen or unreadable
+- isPlausibleScore: false only if goal difference >= 10 or either score > 20 (signs of cheating)
+- confidence: how confident you are in reading the score (1.0=certain, 0.5=partially visible, 0.0=cannot read)
+- screenType: describe what you see so the player understands why it was rejected`}
           ]}],
-          generationConfig:{maxOutputTokens:300,temperature:0}
+          generationConfig:{maxOutputTokens:400,temperature:0}
         })
       });
       const cd=await cr.json();
@@ -1699,8 +1723,9 @@ app.post('/submitScore', async (req, res) => {
     } catch(aiErr){ console.error('[CEE] Gemini Vision error:',aiErr.message); }
 
     if (!ai.isEfootballResultScreen||!ai.isFullResultScreen) {
-      await audit('ANTICHEAT_INVALID_SCREENSHOT',fixtureId,'fixture',`Player ${playerId} submitted non-eFootball screenshot`);
-      return res.json({ success:false, message:'Not a valid eFootball result screen. Upload the correct screenshot.' });
+      await audit('ANTICHEAT_INVALID_SCREENSHOT',fixtureId,'fixture',`Player ${playerId} submitted non-eFootball screenshot: ${ai.screenType||'unknown'}`);
+      const screenDesc = ai.screenType ? ` (detected: ${ai.screenType})` : '';
+      return res.json({ success:false, message:`Not a valid eFootball result screen${screenDesc}. Submit the post-match RESULT screen that appears after the game ends — not the pause menu or any mid-game screen.` });
     }
     if (!ai.isPlausibleScore) {
       await fixRef.update({ collusionFlagGD:true });
@@ -3600,9 +3625,9 @@ app.post('/testAiVerify', async (req, res) => {
       body: JSON.stringify({
         contents: [{ parts: [
           { inline_data: { mime_type: mimeType || 'image/jpeg', data: screenshotBase64 } },
-          { text: `You are analyzing an eFootball (soccer video game) post-match result screen.\nRespond ONLY in JSON, no other text, no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<club name or null>",\n  "awayClubName": "<club name or null>",\n  "isPlausibleScore": true/false,\n  "confidence": <float 0.0-1.0>\n}\nRules:\n- isEfootballResultScreen: true only if clearly eFootball post-match result screen\n- isFullResultScreen: true only if shows complete final result\n- homeGoals/awayGoals: final score integers, null if not readable\n- isPlausibleScore: false if GD>=10 or either score>20\n- confidence: 1.0=certain, 0.0=cannot read` }
+          { text: `You are analyzing a screenshot from eFootball (Konami's soccer video game). Your job is to determine if it shows a FINAL post-match result screen with the completed score.\n\nVALID result screens show: final score prominently displayed, both club names/badges, "RESULT" text or post-match stats screen, full-time summary.\n\nNOT valid: pause menu (Game Plan/Camera/Audio/Quit options), half-time screen, pre-match lobby, in-game HUD, any mid-game screen, or non-eFootball images.\n\nRespond ONLY in JSON with no extra text or markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<club name string or null>",\n  "awayClubName": "<club name string or null>",\n  "isPlausibleScore": true/false,\n  "confidence": <float 0.0-1.0>,\n  "screenType": "<what type of screen this is e.g. post-match result, pause menu, half-time, pre-match, non-efootball>"\n}` }
         ]}],
-        generationConfig: { maxOutputTokens: 300, temperature: 0 }
+        generationConfig: { maxOutputTokens: 400, temperature: 0 }
       })
     });
     const cd = await cr.json();
@@ -3626,7 +3651,7 @@ app.post('/testAiVerify', async (req, res) => {
       isFullResultScreen: ai.isFullResultScreen,
       homeClubName: ai.homeClubName,
       awayClubName: ai.awayClubName,
-      aiNotes: ai.isEfootballResultScreen ? (scoreMatch ? 'Score matches expected result' : `Score mismatch: detected ${detectedA}-${detectedB}, expected ${expectedA}-${expectedB}`) : 'Not an eFootball result screen'
+      aiNotes: ai.isEfootballResultScreen ? (scoreMatch ? 'Score matches expected result' : `Score mismatch: detected ${detectedA}-${detectedB}, expected ${expectedA}-${expectedB}`) : `Not an eFootball result screen — detected: ${ai.screenType || 'unknown screen type'}. Submit the post-match RESULT screen, not the pause menu.`
     });
   } catch(e) {
     console.error('[CEE] testAiVerify error:', e.message);
