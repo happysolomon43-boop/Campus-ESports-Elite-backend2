@@ -729,6 +729,28 @@ async function _sendMatchNotifications(type, fixtureId, playerAId, playerBId, se
       `🔄 <b>Replay scheduled</b>\nCheck the CEE Player Hub for your new match window.`
     );
   }
+  if (type === 'STATS_MISMATCH_REUPLOAD') {
+    await both(
+      'CEE — Stats Mismatch: Reupload Required ⚠️',
+      `<p>⚠️ <strong>Stats mismatch detected between your screenshots!</strong></p>
+       <p>The stat numbers on your two submissions do not match. This means at least one screenshot does not reflect the real match result.</p>
+       <div class="hl">⏰ Both players must reupload the correct Full Time stats board within <strong>6 minutes</strong>.<br>If either player misses this window, <strong>both players are automatically forfeited</strong> — no admin review, no exceptions.</div>
+       <p style="color:#BBBBC8;font-size:13px">This reupload is for re-verification only. Deliberately submitting a screenshot with different numbers is a serious violation and will result in disqualification.</p>`,
+      `⚠️ <b>STATS MISMATCH — REUPLOAD REQUIRED!</b>\n\nThe stats numbers on both screenshots do not match.\n\nBoth players must reupload the correct Full Time stats board within <b>6 minutes</b>.\n\n❌ If either player misses this window, BOTH players are automatically forfeited — no admin review.\n\n🌐 ${process.env.SITE_URL || 'https://cee-esports.web.app'}#hub`
+    );
+  }
+  if (type === 'DOUBLE_FORFEIT') {
+    await both(
+      'CEE — Double Forfeit Applied ⚫',
+      `<p>⚫ <strong>Double forfeit applied to your fixture.</strong></p>
+       <p>The 6-minute stats mismatch reupload window expired without both players submitting matching screenshots. Neither player receives points for this fixture.</p>
+       <div class="hl">Result: 0 – 0 · Double Forfeit — no points awarded to either player</div>`,
+      `⚫ <b>Double forfeit applied.</b>\n\nThe stats mismatch reupload window expired. Both players receive 0 points.\n\nResult: 0 – 0 (Double Forfeit)`
+    );
+    if (adminChat) sendTelegram(adminChat,
+      `⚫ <b>Double forfeit applied</b>\nFixture: ${fixtureId}\nStats mismatch — reupload deadline expired.`
+    ).catch(()=>{});
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -768,6 +790,87 @@ async function _crossValidateScores(fixtureId, fix) {
     await fixRef.update({ collusionFlagGD: true });
     await audit('ANTICHEAT_FLAG', fixtureId, 'fixture', `GD ≥ 6: ${hA}-${aA}`);
   }
+
+  // ── NEW: Cross-screenshot stats comparison ─────────────────────────────────
+  // Both players uploaded screenshots of the SAME match. The stats table must be
+  // identical in both. If they differ, one screenshot is fraudulent.
+  const statsA = fix.aiStatsA || {};
+  const statsB = fix.aiStatsB || {};
+  const statFields = ['shotsOnTargetHome','shotsOnTargetAway','foulsHome','foulsAway',
+                      'tacklesHome','tacklesAway','offsidesHome','offsidesAway'];
+  const statMismatches = [];
+  for (const field of statFields) {
+    const vA = statsA[field], vB = statsB[field];
+    if (vA !== null && vA !== undefined && vB !== null && vB !== undefined && vA !== vB) {
+      statMismatches.push(`${field}: A=${vA} vs B=${vB}`);
+    }
+  }
+  if (statMismatches.length > 0) {
+    const detail = statMismatches.join(', ');
+    const attempt = (fix.statsMismatchAttempt || 0) + 1;
+    await audit('ANTICHEAT_STATS_MISMATCH', fixtureId, 'fixture',
+      `Screenshot stats differ (attempt ${attempt}): ${detail}`);
+
+    if (attempt >= 2) {
+      // Stats STILL don't match after the reupload — both players forfeit immediately, no review
+      await fixRef.update({
+        status: 'approved', result: 'DOUBLE_FORFEIT',
+        isForfeit: true, playerAGoals: 0, playerBGoals: 0,
+        adminApproved: true, done: true,
+        statsMismatchFlag: true, statsMismatchDetail: detail,
+        statsMismatchAttempt: attempt,
+        statsMismatchReuploadWindow: false,
+        doubleForfeitReason: 'Stats mismatch persisted after reupload — both players forfeited',
+        autoApprovedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      await _sendMatchNotifications('DOUBLE_FORFEIT', fixtureId, fix.playerAId, fix.playerBId, fix.seasonId);
+      const adminChatDF = env.telegram && env.telegram.admin_chat_id;
+      if (adminChatDF) sendTelegram(adminChatDF,
+        `🚫 <b>Double forfeit — stats still mismatched after reupload</b>\nFixture: ${fixtureId}\nMismatches: ${detail}`
+      ).catch(()=>{});
+      return;
+    }
+
+    // First mismatch — open a 6-minute reupload window for both players.
+    // Both submissions are cleared so each player can resubmit.
+    // NOTE: requires Firestore composite index: status + statsMismatchReuploadWindow + statsMismatchReuploadDeadline
+    const reuploadDeadline = toTS(nowWAT().plus({ minutes: 6 }));
+    await fixRef.update({
+      // ── Clear both submissions so players can reupload ──
+      playerASubmittedAt:   admin.firestore.FieldValue.delete(),
+      playerBSubmittedAt:   admin.firestore.FieldValue.delete(),
+      playerAScoreSealed:   admin.firestore.FieldValue.delete(),
+      playerBScoreSealed:   admin.firestore.FieldValue.delete(),
+      aiExtractedA:         admin.firestore.FieldValue.delete(),
+      aiExtractedB:         admin.firestore.FieldValue.delete(),
+      aiStatsA:             admin.firestore.FieldValue.delete(),
+      aiStatsB:             admin.firestore.FieldValue.delete(),
+      playerAScreenshotUrl: admin.firestore.FieldValue.delete(),
+      playerBScreenshotUrl: admin.firestore.FieldValue.delete(),
+      imageHashA:           admin.firestore.FieldValue.delete(),
+      imageHashB:           admin.firestore.FieldValue.delete(),
+      aiConfidenceA:        admin.firestore.FieldValue.delete(),
+      aiConfidenceB:        admin.firestore.FieldValue.delete(),
+      screenshotFlaggedForReview: admin.firestore.FieldValue.delete(),
+      screenshotFlagReason: admin.firestore.FieldValue.delete(),
+      opponentUploadDeadline: admin.firestore.FieldValue.delete(), // clear 15-min deadline
+      // ── Stats mismatch reupload window ──
+      statsMismatchFlag:             true,
+      statsMismatchDetail:           detail,
+      statsMismatchReuploadWindow:   true,
+      statsMismatchRejectedAt:       admin.firestore.FieldValue.serverTimestamp(),
+      statsMismatchReuploadDeadline: reuploadDeadline,
+      statsMismatchAttempt:          attempt,
+      status:                        'in_progress'
+    });
+    await _sendMatchNotifications('STATS_MISMATCH_REUPLOAD', fixtureId, fix.playerAId, fix.playerBId, fix.seasonId);
+    const adminChatMM = env.telegram && env.telegram.admin_chat_id;
+    if (adminChatMM) sendTelegram(adminChatMM,
+      `⚠️ <b>Stats mismatch — 6-min reupload window opened</b>\nFixture: ${fixtureId}\nMismatches: ${detail}\nBoth players notified to reupload.`
+    ).catch(()=>{});
+    return; // Do not continue to score-match / dispute logic
+  }
+  // ── END stats comparison ───────────────────────────────────────────────────
 
   const [prevA, prevB] = await Promise.all([
     db.collection('fixtures').where('seasonId','==',fix.seasonId).where('status','==','approved')
@@ -821,7 +924,14 @@ async function _crossValidateScores(fixtureId, fix) {
   }
 
   const autoApproveAt = toTS(nowWAT().plus({ minutes: 45 }));
-  await fixRef.update({ status:'pending_approval', autoApproveAt, playerAGoals: hA, playerBGoals: aA, adminApproved: false });
+  await fixRef.update({
+    status:'pending_approval', autoApproveAt, playerAGoals: hA, playerBGoals: aA, adminApproved: false,
+    // Clear reupload window state now that scores are confirmed matching
+    ...(fix.statsMismatchReuploadWindow ? {
+      statsMismatchReuploadWindow: false,
+      statsMismatchReuploadDeadline: admin.firestore.FieldValue.delete()
+    } : {})
+  });
   await _sendMatchNotifications('RESULT_PENDING', fixtureId, fix.playerAId, fix.playerBId, fix.seasonId);
 }
 
@@ -1668,7 +1778,20 @@ app.post('/submitScore', async (req, res) => {
     if (fix.windowOpenTime&&nowJsDate<fix.windowOpenTime.toDate())
       return res.json({ success:false, message:'Match window has not opened yet.' });
     const alreadyKey=isHome?'playerASubmittedAt':'playerBSubmittedAt';
-    if (fix[alreadyKey]) return res.json({ success:false, message:'You have already submitted.' });
+
+    // Block submission if the stats-mismatch reupload window has already expired
+    if (fix.statsMismatchReuploadWindow && fix.statsMismatchReuploadDeadline) {
+      if (nowJsDate > fix.statsMismatchReuploadDeadline.toDate()) {
+        return res.json({
+          success:false, verdict:'reupload_expired',
+          message:'⏰ The 6-minute reupload window has expired. Both players have been automatically forfeited due to the stats mismatch.'
+        });
+      }
+    }
+    // Block duplicate submission unless we are inside a stats-mismatch reupload window
+    // (in which case playerASubmittedAt/playerBSubmittedAt were deleted so fix[alreadyKey] is null anyway)
+    if (fix[alreadyKey] && !fix.statsMismatchReuploadWindow)
+      return res.json({ success:false, message:'You have already submitted.' });
 
     const imgBuf=Buffer.from(imageData,'base64');
     const imgHash=crypto.createHash('sha256').update(imgBuf).digest('hex');
@@ -1680,41 +1803,139 @@ app.post('/submitScore', async (req, res) => {
       return res.json({ success:false, message:'Screenshot matches opponent submission — anti-cheat flag raised.' });
     }
 
-    let ai={ isEfootballResultScreen:false,homeGoals:null,awayGoals:null,confidence:0,homeClubName:null,awayClubName:null,isPlausibleScore:false,isFullResultScreen:false };
+    // ── LOAD PLAYER IDENTIFIERS FOR GEMINI PROMPT INJECTION ──────────────────
+    let homePlayer={ clubName:'', gameName:'', initials:'' };
+    let awayPlayer={ clubName:'', gameName:'', initials:'' };
+    try {
+      const [pASnap, pBSnap] = await Promise.all([
+        fix.playerAId ? db.collection('players').doc(fix.playerAId).get() : Promise.resolve(null),
+        fix.playerBId ? db.collection('players').doc(fix.playerBId).get() : Promise.resolve(null)
+      ]);
+      if (pASnap && pASnap.exists) {
+        const d = pASnap.data();
+        homePlayer = { clubName: d.clubName||'', gameName: d.gameName||'', initials: d.initials||'' };
+      }
+      if (pBSnap && pBSnap.exists) {
+        const d = pBSnap.data();
+        awayPlayer = { clubName: d.clubName||'', gameName: d.gameName||'', initials: d.initials||'' };
+      }
+    } catch(idErr){ console.error('[CEE] Player identifier load:',idErr.message); }
+
+    // ── GEMINI STATS BOARD ANALYSIS (Blueprint v1.0) ──────────────────────────
+    let ai={
+      isEfootballStatsBoard:false, screenType:'unknown',
+      timelineLabel:null, timelineAccepted:false,
+      homeTeamName:null, awayTeamName:null, homeNameMatch:'no', awayNameMatch:'no',
+      homeGoals:null, awayGoals:null,
+      shotsOnTargetHome:null, shotsOnTargetAway:null,
+      foulsHome:null, foulsAway:null,
+      tacklesHome:null, tacklesAway:null,
+      offsidesHome:null, offsidesAway:null,
+      suspiciousScoreToShots:false, extremeScore:false, homeAwaySwap:false,
+      matchSummary:null, homeAnalysis:null, awayAnalysis:null, keyStatInsight:null,
+      confidence:0, rejectionReason:null
+    };
     try {
       const geminiUrl=`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${env.gemini.key}`;
+      const geminiPrompt=`You are the CEE (Campus eSports Elite) AI Match Verifier.
+CEE is a competitive eFootball (Konami soccer video game) campus tournament platform.
+Your task is to analyse the submitted screenshot and extract structured match data.
+
+// ─── FIXTURE CONTEXT (injected from Firestore) ─────────────────────────────
+Home Player: Club="${homePlayer.clubName}" | GameTag="${homePlayer.gameName}" | Initials="${homePlayer.initials}"
+Away Player: Club="${awayPlayer.clubName}" | GameTag="${awayPlayer.gameName}" | Initials="${awayPlayer.initials}"
+
+// ─── WHAT A VALID EFOOTBALL STATS BOARD LOOKS LIKE ────────────────────────
+A VALID eFootball stats board has ALL of these elements:
+  1. SCORE BANNER: Dark navy blue (#1a1a6e) horizontal band across the top half of screen. Home team name in large bold yellow text on the LEFT side. Away team name in large bold yellow text on the RIGHT side. Two solid yellow square boxes showing integer goal scores, flanking the eFootball logo (three horizontal lines of different widths — a stylised letter E).
+  2. TIMELINE BAR: A solid yellow/gold (#e6c22a) rectangular bar directly below the score banner. Dark navy text centred inside it. Possible values: "Full Time", "Full Time (AET)", "Penalty Shootout", "Half Time", "Interval". The ONLY acceptable values for CEE are: "Full Time", "Full Time (AET)", "Penalty Shootout".
+  3. STATS TABLE: Dark navy background, 3-column layout in the centre-middle of the screen: [Home value] | [Stat label] | [Away value]. Rows always in this order: Possession (%), Shots, Shots on Target, Fouls, Offsides, Corner Kicks, Free Kicks, Passes, Successful Passes, Crosses, Interceptions, Tackles, Saves.
+  4. SIDE AREAS: Yellow/gold background on both sides of the stats table. Diagonal navy chevron/arrow stripe pattern. Team crest badge image in the centre of each side area.
+  5. NAVIGATION: A cyan/blue rounded-rectangle button at the screen bottom. "Next ›" at bottom-RIGHT = Full Time or later phase. "‹ Back" at bottom-LEFT = Half Time.
+
+// ─── SCREENS TO REJECT IMMEDIATELY ───────────────────────────────────────
+REJECT instantly (isEfootballStatsBoard=false) if the image is:
+  - Pause menu (shows: Game Plan, Command List, Camera, Audio, Quit Match options)
+  - Pre-match lobby or team selection screen
+  - In-game HUD (score shown as overlay during match, players actively moving)
+  - Photo of a phone screen (meta-screenshot with visible phone edges)
+  - Social media post, video thumbnail, or any non-gameplay screen
+  - Any image lacking the navy/yellow stats board colour scheme and structure above
+
+// ─── EXTRACTION INSTRUCTIONS ──────────────────────────────────────────────
+If this IS a valid stats board:
+
+  STEP 1 — Read Timeline Label from yellow bar. Extract exact text.
+  If "Half Time": timelineAccepted=false, rejectionReason="Half Time screenshot detected. Your match is still in progress — only 45 minutes have been played. Play the full 90 minutes, then submit the Full Time stats board that appears at the end."
+  If "Interval": timelineAccepted=false, rejectionReason="Extra time interval screenshot detected. Your match has a second half of extra time still to play. Submit the Full Time (AET) screenshot after extra time finishes."
+  If "Full Time (AET)" or "Penalty Shootout": timelineAccepted=true (but flag for admin review).
+  If "Full Time": timelineAccepted=true.
+
+  STEP 2 — Read Score from the two yellow boxes. Left box = homeGoals, Right = awayGoals.
+
+  STEP 3 — Read Team Names from the score banner.
+  homeTeamName = text on LEFT of score banner.
+  awayTeamName = text on RIGHT of score banner.
+  homeNameMatch = fuzzy compare homeTeamName vs all 3 home player identifiers → "yes"/"partial"/"no"
+  awayNameMatch = fuzzy compare awayTeamName vs all 3 away player identifiers → "yes"/"partial"/"no"
+  "yes" = 80%+ similarity. "partial" = 50-79% similarity. "no" = below 50%.
+
+  STEP 4 — Read Key Stats from table:
+  shotsOnTargetHome, shotsOnTargetAway, foulsHome, foulsAway, tacklesHome, tacklesAway, offsidesHome, offsidesAway
+
+  STEP 5 — Anti-cheat flags (set to true if triggered):
+  suspiciousScoreToShots: homeGoals >= 5 AND shotsOnTargetHome <= 1, OR awayGoals >= 5 AND shotsOnTargetAway <= 1
+  extremeScore: abs(homeGoals - awayGoals) >= 10 OR homeGoals > 15 OR awayGoals > 15
+  homeAwaySwap: homeTeamName matches AWAY player identifiers AND awayTeamName matches HOME player identifiers
+
+  STEP 6 — Match Analysis (only if isEfootballStatsBoard=true AND timelineAccepted=true):
+  matchSummary: 2–3 sentence narrative of how the match played out based on the full stats.
+  homeAnalysis: { strengths: [2–3 items], improvements: [2–3 items] }
+  awayAnalysis: { strengths: [2–3 items], improvements: [2–3 items] }
+  keyStatInsight: 1 sentence highlighting the single most interesting statistical contrast.
+
+// ─── OUTPUT INSTRUCTION ───────────────────────────────────────────────────
+Respond ONLY with a valid JSON object. No markdown. No code fences. No explanation.
+No preamble. No trailing text. Just the raw JSON starting with { and ending with }.
+
+Required fields:
+{
+  "isEfootballStatsBoard": true/false,
+  "screenType": "string description",
+  "timelineLabel": "exact text from yellow bar or null",
+  "timelineAccepted": true/false,
+  "homeTeamName": "string or null",
+  "awayTeamName": "string or null",
+  "homeNameMatch": "yes"/"partial"/"no",
+  "awayNameMatch": "yes"/"partial"/"no",
+  "homeGoals": integer or null,
+  "awayGoals": integer or null,
+  "shotsOnTargetHome": integer or null,
+  "shotsOnTargetAway": integer or null,
+  "foulsHome": integer or null,
+  "foulsAway": integer or null,
+  "tacklesHome": integer or null,
+  "tacklesAway": integer or null,
+  "offsidesHome": integer or null,
+  "offsidesAway": integer or null,
+  "suspiciousScoreToShots": false,
+  "extremeScore": false,
+  "homeAwaySwap": false,
+  "matchSummary": "string or null",
+  "homeAnalysis": { "strengths": [], "improvements": [] } or null,
+  "awayAnalysis": { "strengths": [], "improvements": [] } or null,
+  "keyStatInsight": "string or null",
+  "confidence": 0.0-1.0,
+  "rejectionReason": "string or null"
+}`;
       const cr=await fetch(geminiUrl,{
         method:'POST', headers:{'Content-Type':'application/json'},
         body:JSON.stringify({
           contents:[{parts:[
             {inline_data:{mime_type:mediaType||'image/jpeg',data:imageData}},
-            {text:`You are analyzing a screenshot from eFootball (Konami's soccer video game). Your job is to determine if it shows a FINAL post-match result screen with the completed score.
-
-VALID result screens show: final score prominently displayed, both club names/badges, "RESULT" text or post-match stats screen, full-time summary.
-
-NOT valid result screens: pause menu (shows Game Plan/Camera/Audio/Quit options), half-time screen, pre-match lobby, in-game HUD, any mid-game screen, or non-eFootball images.
-
-Respond ONLY in JSON with no extra text or markdown:
-{
-  "isEfootballResultScreen": true/false,
-  "isFullResultScreen": true/false,
-  "homeGoals": <integer or null>,
-  "awayGoals": <integer or null>,
-  "homeClubName": "<club name string or null>",
-  "awayClubName": "<club name string or null>",
-  "isPlausibleScore": true/false,
-  "confidence": <float 0.0-1.0>,
-  "screenType": "<what type of screen this is e.g. 'post-match result', 'pause menu', 'half-time', 'pre-match', 'non-efootball', etc.>"
-}
-Rules:
-- isEfootballResultScreen: true ONLY if this is clearly the eFootball post-match RESULT/summary screen after the match has fully ended
-- isFullResultScreen: true only if the complete final score is clearly readable
-- homeGoals/awayGoals: exact integers from the final score, null if not a result screen or unreadable
-- isPlausibleScore: false only if goal difference >= 10 or either score > 20 (signs of cheating)
-- confidence: how confident you are in reading the score (1.0=certain, 0.5=partially visible, 0.0=cannot read)
-- screenType: describe what you see so the player understands why it was rejected`}
+            {text:geminiPrompt}
           ]}],
-          generationConfig:{maxOutputTokens:400,temperature:0}
+          generationConfig:{maxOutputTokens:1200,temperature:0}
         })
       });
       const cd=await cr.json();
@@ -1722,48 +1943,59 @@ Rules:
       ai=JSON.parse(raw.replace(/```json|```/g,'').trim());
     } catch(aiErr){ console.error('[CEE] Gemini Vision error:',aiErr.message); }
 
-    if (!ai.isEfootballResultScreen||!ai.isFullResultScreen) {
-      await audit('ANTICHEAT_INVALID_SCREENSHOT',fixtureId,'fixture',`Player ${playerId} submitted non-eFootball screenshot: ${ai.screenType||'unknown'}`);
+    // ── GATE C1: Not a stats board at all ─────────────────────────────────────
+    if (!ai.isEfootballStatsBoard) {
+      await audit('ANTICHEAT_INVALID_SCREENSHOT',fixtureId,'fixture',`Player ${playerId} submitted non-stats-board: ${ai.screenType||'unknown'}`);
       const screenDesc = ai.screenType ? ` (detected: ${ai.screenType})` : '';
-      return res.json({ success:false, message:`Not a valid eFootball result screen${screenDesc}. Submit the post-match RESULT screen that appears after the game ends — not the pause menu or any mid-game screen.` });
-    }
-    if (!ai.isPlausibleScore) {
-      await fixRef.update({ collusionFlagGD:true });
-      await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Implausible score: ${ai.homeGoals}-${ai.awayGoals}`);
+      return res.json({ success:false, verdict:'rejected', screenType:ai.screenType||null, message:`Not a valid eFootball stats board${screenDesc}. Submit the Full Time stats board that appears after your match ends — not the pause menu, half-time screen, or any in-game screen.` });
     }
 
-    // AC-1: club name fuzzy match
-    try {
-      const fixData=(await fixRef.get()).data();
-      const pADoc=fixData.playerAId?await db.collection('players').doc(fixData.playerAId).get():null;
-      const pBDoc=fixData.playerBId?await db.collection('players').doc(fixData.playerBId).get():null;
-      const clubA=pADoc&&pADoc.exists?(pADoc.data().clubName||'').toLowerCase().trim():'';
-      const clubB=pBDoc&&pBDoc.exists?(pBDoc.data().clubName||'').toLowerCase().trim():'';
-      const ssHomeRaw=(ai.homeClubName||'').toLowerCase().trim();
-      const ssAwayRaw=(ai.awayClubName||'').toLowerCase().trim();
-      const onScreen=[ssHomeRaw,ssAwayRaw].filter(Boolean);
-      const registered=[clubA,clubB].filter(Boolean);
-      let bothMatch=false;
-      if (onScreen.length>=2&&registered.length>=2) {
-        const [ssH,ssA]=onScreen,[rA,rB]=registered;
-        bothMatch=(_stringSimilarity(ssH,rA)>=CLUB_MATCH_THRESHOLD&&_stringSimilarity(ssA,rB)>=CLUB_MATCH_THRESHOLD)||
-                  (_stringSimilarity(ssH,rB)>=CLUB_MATCH_THRESHOLD&&_stringSimilarity(ssA,rA)>=CLUB_MATCH_THRESHOLD);
-      }
-      if (onScreen.length>=2&&!bothMatch) {
-        await fixRef.update({ clubNameMismatchFlag:true, clubNameMismatchDetail:`Screen: ${ssHomeRaw} vs ${ssAwayRaw} | Registered: ${clubA} vs ${clubB}` });
-        await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Club name mismatch: ${ssHomeRaw}/${ssAwayRaw} vs ${clubA}/${clubB}`);
-        return res.json({ success:false, message:'Club names on screenshot do not match this fixture. Make sure you are submitting the correct match result.' });
-      }
-    } catch(clubErr){ console.error('[CEE] Club name check:',clubErr.message); }
+    // ── GATE C2: Wrong timeline ────────────────────────────────────────────────
+    if (!ai.timelineAccepted) {
+      await audit('ANTICHEAT_INVALID_SCREENSHOT',fixtureId,'fixture',`Player ${playerId} wrong timeline: ${ai.timelineLabel||'unknown'}`);
+      return res.json({ success:false, verdict:'rejected', timelineLabel:ai.timelineLabel, message: ai.rejectionReason || `Wrong timeline detected (${ai.timelineLabel||'unknown'}). Submit the Full Time stats board.` });
+    }
 
+    // ── C3–C6: Confidence scoring ──────────────────────────────────────────────
     const conf=ai.confidence||0;
     let flagged=false, flagReason='';
-    if (conf<0.60) {
+    // Timeline accepted = Full Time (AET) or Penalty Shootout → flag for admin
+    const isExtraTime=(ai.timelineLabel==='Full Time (AET)'||ai.timelineLabel==='Penalty Shootout');
+    if (isExtraTime){ flagged=true; flagReason=`${ai.timelineLabel} result — admin confirmation required`; }
+
+    // Anti-cheat flags from Blueprint
+    if (ai.suspiciousScoreToShots){
+      flagged=true; flagReason=flagReason||'Suspicious score-to-shots ratio';
+      await fixRef.update({ collusionFlagGD:true });
+      await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Suspicious score/shots: ${ai.homeGoals}-${ai.awayGoals}`);
+    }
+    if (ai.extremeScore){
+      flagged=true; flagReason=flagReason||'Extreme score detected';
+      await fixRef.update({ collusionFlagGD:true });
+      await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Extreme score: ${ai.homeGoals}-${ai.awayGoals}`);
+    }
+    if (ai.homeAwaySwap){
+      flagged=true; flagReason=flagReason||'Home/away perspective swap detected';
+      await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Perspective swap: home=${ai.homeTeamName}, away=${ai.awayTeamName}`);
+    }
+
+    // Name matching logic (C4+C5)
+    const bothNamesNo = ai.homeNameMatch==='no' && ai.awayNameMatch==='no';
+    const oneNameNo   = (ai.homeNameMatch==='no' || ai.awayNameMatch==='no') && !bothNamesNo;
+    if (bothNamesNo){
+      await fixRef.update({ clubNameMismatchFlag:true, clubNameMismatchDetail:`Screen: ${ai.homeTeamName||'?'} vs ${ai.awayTeamName||'?'} | Registered: ${homePlayer.clubName||homePlayer.gameName} vs ${awayPlayer.clubName||awayPlayer.gameName}` });
+      await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Both names no-match: ${ai.homeTeamName}/${ai.awayTeamName}`);
+      return res.json({ success:false, verdict:'rejected', message:'Club names on screenshot do not match this fixture. Make sure you are submitting the correct match result.' });
+    }
+    if (oneNameNo){ flagged=true; flagReason=flagReason||'One team name could not be confirmed — admin review'; }
+
+    // Confidence threshold
+    if (conf<0.60 && !flagged) {
       const retryKey=isHome?'playerARetryCount':'playerBRetryCount';
       const retries=fix[retryKey]||0;
       if (retries>=1){ flagged=true; flagReason='Low AI confidence after retry — admin review required'; }
-      else { await fixRef.update({[retryKey]:retries+1}); return res.json({ success:false,retry:true,confidence:conf,message:`Screenshot unclear (${Math.round(conf*100)}% confidence). Upload a clearer result screen. 1 retry remaining.` }); }
-    } else if (conf<0.85){ flagged=true; flagReason=`AI confidence ${Math.round(conf*100)}% — below auto-accept threshold`; }
+      else { await fixRef.update({[retryKey]:retries+1}); return res.json({ success:false,retry:true,confidence:conf,verdict:'retry',message:`Stats board unclear (${Math.round(conf*100)}% confidence). Upload a clearer screenshot. 1 retry remaining.` }); }
+    } else if (conf<0.85 && !flagged){ flagged=true; flagReason=`AI confidence ${Math.round(conf*100)}% — below auto-accept threshold`; }
 
     const fname=`screenshots/${fixtureId}/${playerId}/${Date.now()}.jpg`;
     const bucket=storage.bucket(), file=bucket.file(fname);
@@ -1773,9 +2005,16 @@ Rules:
     const scoreStr=(ai.homeGoals!==null&&ai.awayGoals!==null)?`${ai.homeGoals}-${ai.awayGoals}`:'unknown';
     const sealed=crypto.createHash('sha256').update(scoreStr+fixtureId).digest('hex');
     const nowFV=admin.firestore.FieldValue.serverTimestamp();
+    // Full stats snapshot for cross-comparison
+    const aiStats={ home:ai.homeGoals, away:ai.awayGoals,
+      shotsOnTargetHome:ai.shotsOnTargetHome, shotsOnTargetAway:ai.shotsOnTargetAway,
+      foulsHome:ai.foulsHome, foulsAway:ai.foulsAway,
+      tacklesHome:ai.tacklesHome, tacklesAway:ai.tacklesAway,
+      offsidesHome:ai.offsidesHome, offsidesAway:ai.offsidesAway,
+      timelineLabel:ai.timelineLabel, homeTeamName:ai.homeTeamName, awayTeamName:ai.awayTeamName };
     const update={};
-    if (isHome){ Object.assign(update,{playerAScoreSealed:sealed,playerAScreenshotUrl:ssUrl,playerASubmittedAt:nowFV,aiConfidenceA:conf,aiExtractedA:{home:ai.homeGoals,away:ai.awayGoals},imageHashA:imgHash}); }
-    else       { Object.assign(update,{playerBScoreSealed:sealed,playerBScreenshotUrl:ssUrl,playerBSubmittedAt:nowFV,aiConfidenceB:conf,aiExtractedB:{home:ai.homeGoals,away:ai.awayGoals},imageHashB:imgHash}); }
+    if (isHome){ Object.assign(update,{playerAScoreSealed:sealed,playerAScreenshotUrl:ssUrl,playerASubmittedAt:nowFV,aiConfidenceA:conf,aiExtractedA:{home:ai.homeGoals,away:ai.awayGoals},aiStatsA:aiStats,imageHashA:imgHash}); }
+    else       { Object.assign(update,{playerBScoreSealed:sealed,playerBScreenshotUrl:ssUrl,playerBSubmittedAt:nowFV,aiConfidenceB:conf,aiExtractedB:{home:ai.homeGoals,away:ai.awayGoals},aiStatsB:aiStats,imageHashB:imgHash}); }
     if (flagged){ update.screenshotFlaggedForReview=true; update.screenshotFlagReason=flagReason; }
     await fixRef.update(update);
 
@@ -1793,9 +2032,44 @@ Rules:
         await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Suspicious: ${Math.round(diff/60)} min gap`);
       }
       await _crossValidateScores(fixtureId,fresh);
-    } else { await logNotif(fixtureId,playerId,'telegram','SUBMISSION_RECEIVED','sent'); }
+    } else {
+      await logNotif(fixtureId,playerId,'telegram','SUBMISSION_RECEIVED','sent');
+      // ── Set 15-minute opponent upload deadline on the FIRST submission ──────
+      // Condition: the other player hasn't submitted yet, and this isn't a
+      // stats-mismatch reupload window (which has its own 6-min deadline), and
+      // we haven't already set an opponent deadline.
+      // NOTE: requires Firestore composite index: status + opponentUploadDeadline
+      const otherSubmitted = isHome ? fix.playerBSubmittedAt : fix.playerASubmittedAt;
+      const isFirstSub = !otherSubmitted
+        && !fix.statsMismatchReuploadWindow
+        && !fix.opponentUploadDeadline;
+      if (isFirstSub) {
+        const oppDeadline = toTS(nowWAT().plus({ minutes: 15 }));
+        await fixRef.update({ opponentUploadDeadline: oppDeadline });
+        const opponentId = isHome ? fix.playerBId : fix.playerAId;
+        await _notifyPlayer(opponentId, fixtureId, 'OPPONENT_SUBMITTED',
+          'CEE — Submit Your Result Now! ⏰',
+          `<p>⏰ <strong>Your opponent has submitted their result!</strong></p>
+           <p>You now have <strong>15 minutes</strong> to upload your Full Time stats board.
+           If you miss this window your opponent wins automatically — <strong>3-0 forfeit</strong>.</p>
+           <div class="hl">⚠️ Deadline: 15 minutes from now — act immediately!</div>`,
+          `⏰ <b>URGENT: Submit your result NOW!</b>\n\nYour opponent has submitted their screenshot. You have exactly <b>15 minutes</b> to upload yours, or you forfeit the match 3-0.\n\n🌐 ${process.env.SITE_URL || 'https://cee-esports.web.app'}#hub`
+        ).catch(()=>{});
+      }
+    }
 
-    return res.json({ success:true, confidence:conf, message:'Screenshot sealed. Awaiting opponent submission.' });
+    const verdict = flagged ? 'needs_review' : 'approved';
+    return res.json({
+      success:true, verdict, confidence:conf, timelineLabel:ai.timelineLabel,
+      homeGoals:ai.homeGoals, awayGoals:ai.awayGoals,
+      homeNameMatch:ai.homeNameMatch, awayNameMatch:ai.awayNameMatch,
+      matchSummary:ai.matchSummary||null, homeAnalysis:ai.homeAnalysis||null,
+      awayAnalysis:ai.awayAnalysis||null, keyStatInsight:ai.keyStatInsight||null,
+      flagReason: flagged ? flagReason : null,
+      message: flagged
+        ? 'Stats board verified. Result flagged for admin review — you will be notified.'
+        : 'Stats board verified. Score sealed. Awaiting opponent submission.'
+    });
   } catch(e){ console.error('[CEE] submitScore:',e); return res.status(500).json({ success:false, message:'Server error: '+e.message }); }
 });
 
@@ -2547,6 +2821,51 @@ app.post('/liftForceMajeure', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /approveResult — admin manually approves a pending_approval fixture
+// Writes to Firestore AND sends RESULT_APPROVED notifications to both players.
+// Use this instead of writing directly to Firestore from the admin UI so that
+// players actually receive their approval notification.
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/approveResult', async (req, res) => {
+  if (!assertAdminSecret(req, res)) return;
+  const { fixtureId } = req.body;
+  if (!fixtureId) return res.status(400).json({ success: false, message: 'Missing fixtureId' });
+  try {
+    const fixRef  = db.collection('fixtures').doc(fixtureId);
+    const fixSnap = await fixRef.get();
+    if (!fixSnap.exists) return res.status(404).json({ success: false, message: 'Fixture not found' });
+    const fix = fixSnap.data();
+
+    if (fix.adminApproved) return res.json({ success: false, message: 'Already approved.' });
+
+    await fixRef.update({
+      adminApproved:   true,
+      adminApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
+      status:          'approved',
+      done:            true,
+      adminOverride:   false
+    });
+
+    await audit('APPROVE_RESULT', fixtureId, 'fixture', 'Admin manually approved result');
+
+    // Notify both players — this is what the direct-Firestore-write path was missing
+    const seasonId = fix.seasonId;
+    await _sendMatchNotifications('RESULT_APPROVED', fixtureId, fix.playerAId, fix.playerBId, seasonId);
+
+    // Recalculate standings
+    if (seasonId) {
+      await _recalcStandingsInternal(seasonId).catch(e => console.error('[CEE] approveResult recalc:', e));
+      await _checkKnockoutQualification(seasonId).catch(e => console.error('[CEE] approveResult knockout:', e));
+    }
+
+    return res.json({ success: true, message: 'Result approved and players notified.' });
+  } catch(e) {
+    console.error('[CEE] approveResult:', e);
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // POST /recalculateStandings
 // ═══════════════════════════════════════════════════════════════════════════
 app.post('/recalculateStandings', async (req, res) => {
@@ -3175,6 +3494,80 @@ async function runSubmissionDeadlineEnforcer() {
     await db.collection('seasons').doc(seasonId).update({standingsDirty:true}).catch(()=>{});
     await _recalcStandingsInternal(seasonId); await _checkKnockoutQualification(seasonId);
   }
+
+  // ── 15-minute opponent upload deadline ────────────────────────────────────
+  // Fires when the first-submitter's opponent hasn't uploaded within 15 min.
+  // Requires Firestore composite index: seasonId + status + opponentUploadDeadline
+  try {
+    const oppSnap = await db.collection('fixtures')
+      .where('seasonId','==',seasonId)
+      .where('status','==','in_progress')
+      .where('opponentUploadDeadline','<=',nowTs).get();
+    const oppBatch = db.batch(); const oppNotifys = [];
+    for (const doc of oppSnap.docs) {
+      const f = doc.data();
+      const aIn = !!f.playerASubmittedAt, bIn = !!f.playerBSubmittedAt;
+      // Only act when exactly ONE player has submitted
+      if (aIn && !bIn) {
+        oppBatch.update(doc.ref, {
+          status:'approved', result:'FORFEIT_B', isForfeit:true,
+          playerAGoals:3, playerBGoals:0, adminApproved:true, done:true,
+          forfeitReason:'15-minute opponent upload deadline expired',
+          autoApprovedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        oppNotifys.push({type:'FORFEIT_APPLIED',fixtureId:doc.id,pA:f.playerAId,pB:f.playerBId});
+        audit('OPPONENT_DEADLINE_FORFEIT',doc.id,'fixture','Player B forfeited — missed 15-min upload window').catch(()=>{});
+      } else if (!aIn && bIn) {
+        oppBatch.update(doc.ref, {
+          status:'approved', result:'FORFEIT_A', isForfeit:true,
+          playerAGoals:0, playerBGoals:3, adminApproved:true, done:true,
+          forfeitReason:'15-minute opponent upload deadline expired',
+          autoApprovedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        oppNotifys.push({type:'FORFEIT_APPLIED',fixtureId:doc.id,pA:f.playerAId,pB:f.playerBId});
+        audit('OPPONENT_DEADLINE_FORFEIT',doc.id,'fixture','Player A forfeited — missed 15-min upload window').catch(()=>{});
+      }
+      // Both submitted or neither submitted — do nothing (handled by other paths)
+    }
+    await oppBatch.commit();
+    for (const n of oppNotifys) await _sendMatchNotifications(n.type,n.fixtureId,n.pA,n.pB,seasonId);
+    if (oppNotifys.length) {
+      await db.collection('seasons').doc(seasonId).update({standingsDirty:true}).catch(()=>{});
+      await _recalcStandingsInternal(seasonId); await _checkKnockoutQualification(seasonId);
+    }
+  } catch(e) { console.error('[CEE] opponentDeadlineCheck:',e.message); }
+
+  // ── 6-minute stats mismatch reupload deadline ─────────────────────────────
+  // Fires when the 6-min reupload window expires → DOUBLE_FORFEIT both players.
+  // Requires Firestore composite index: seasonId + status + statsMismatchReuploadWindow + statsMismatchReuploadDeadline
+  try {
+    const mmSnap = await db.collection('fixtures')
+      .where('seasonId','==',seasonId)
+      .where('status','==','in_progress')
+      .where('statsMismatchReuploadWindow','==',true)
+      .where('statsMismatchReuploadDeadline','<=',nowTs).get();
+    const mmBatch = db.batch(); const mmNotifys = [];
+    for (const doc of mmSnap.docs) {
+      const f = doc.data();
+      mmBatch.update(doc.ref, {
+        status:'approved', result:'DOUBLE_FORFEIT',
+        isForfeit:true, playerAGoals:0, playerBGoals:0,
+        adminApproved:true, done:true,
+        statsMismatchReuploadWindow: false,
+        doubleForfeitReason:'Stats mismatch 6-minute reupload window expired',
+        autoApprovedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      mmNotifys.push({type:'DOUBLE_FORFEIT',fixtureId:doc.id,pA:f.playerAId,pB:f.playerBId});
+      audit('REUPLOAD_DOUBLE_FORFEIT',doc.id,'fixture','Double forfeit — stats mismatch reupload deadline expired').catch(()=>{});
+    }
+    await mmBatch.commit();
+    for (const n of mmNotifys) await _sendMatchNotifications(n.type,n.fixtureId,n.pA,n.pB,seasonId);
+    if (mmNotifys.length) {
+      await db.collection('seasons').doc(seasonId).update({standingsDirty:true}).catch(()=>{});
+      await _recalcStandingsInternal(seasonId); await _checkKnockoutQualification(seasonId);
+    }
+  } catch(e) { console.error('[CEE] statsMismatchReuploadCheck:',e.message); }
+
   console.log(`[CEE] submissionDeadlineEnforcer: processed ${snap.size}`);
 }
 cron.schedule('*/10 * * * *', () => runSubmissionDeadlineEnforcer().catch(e => console.error('[CEE] submissionDeadlineEnforcer error:',e)));
@@ -3219,8 +3612,13 @@ async function runAutoApprover() {
   const flagged48=await db.collection('fixtures').where('seasonId','==',seasonId)
     .where('status','==','pending_approval').where('screenshotFlaggedForReview','==',true).get();
   for (const doc of flagged48.docs) {
-    const f=doc.data(); if (!f.playerASubmittedAt) continue;
-    const hoursElapsed=nowWAT().diff(fromTS(f.playerASubmittedAt),'hours').hours;
+    const f=doc.data(); if (!f.playerASubmittedAt && !f.playerBSubmittedAt) continue;
+    // Use the LATER of the two submission timestamps so admin gets the full 48hr window
+    // from when BOTH screenshots were available, not just when the first one arrived.
+    const tsA = f.playerASubmittedAt ? fromTS(f.playerASubmittedAt) : null;
+    const tsB = f.playerBSubmittedAt ? fromTS(f.playerBSubmittedAt) : null;
+    const lastSubmittedAt = (tsA && tsB) ? (tsA > tsB ? tsA : tsB) : (tsA || tsB);
+    const hoursElapsed=nowWAT().diff(lastSubmittedAt,'hours').hours;
     if (hoursElapsed>=48) {
       batch.update(doc.ref,{adminApproved:true,status:'approved',done:true,
         autoApprovedAt:admin.firestore.FieldValue.serverTimestamp(),
@@ -3611,52 +4009,140 @@ db.collection('registrations').onSnapshot(snapshot => {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ADMIN: TEST AI VERIFIER (standalone — no fixture required)
+// ADMIN: TEST AI VERIFIER — Full Blueprint breakdown (adminVerifyScreenshot)
+// POST /adminVerifyScreenshot  { imageBase64, mimeType, homeIdentifiers, awayIdentifiers, fixtureId? }
+// Returns full 6-clue breakdown for debugging, disputes, and system testing.
 // ═══════════════════════════════════════════════════════════════════════════
-app.post('/testAiVerify', async (req, res) => {
+app.post('/adminVerifyScreenshot', async (req, res) => {
   if (!assertAdminSecret(req, res)) return;
-  const { screenshotBase64, mimeType, playerAGoals, playerBGoals } = req.body;
-  if (!screenshotBase64) return res.status(400).json({ success: false, message: 'Missing screenshotBase64' });
+  const { imageBase64, mimeType, homeIdentifiers, awayIdentifiers, fixtureId } = req.body;
+  if (!imageBase64) return res.status(400).json({ success: false, message: 'Missing imageBase64' });
   try {
+    // Allow passing identifiers directly or loading from a fixture
+    let hId = homeIdentifiers || { clubName:'', gameName:'', initials:'' };
+    let aId = awayIdentifiers || { clubName:'', gameName:'', initials:'' };
+    if (fixtureId && !homeIdentifiers) {
+      try {
+        const fixSnap = await db.collection('fixtures').doc(fixtureId).get();
+        if (fixSnap.exists) {
+          const fd = fixSnap.data();
+          const [pA, pB] = await Promise.all([
+            fd.playerAId ? db.collection('players').doc(fd.playerAId).get() : null,
+            fd.playerBId ? db.collection('players').doc(fd.playerBId).get() : null
+          ]);
+          if (pA && pA.exists) { const d=pA.data(); hId={clubName:d.clubName||'',gameName:d.gameName||'',initials:d.initials||''}; }
+          if (pB && pB.exists) { const d=pB.data(); aId={clubName:d.clubName||'',gameName:d.gameName||'',initials:d.initials||''}; }
+        }
+      } catch(fErr){ console.error('[CEE] adminVerifyScreenshot fixture load:', fErr.message); }
+    }
+
     const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${env.gemini.key}`;
+    const geminiPrompt=`You are the CEE (Campus eSports Elite) AI Match Verifier.
+CEE is a competitive eFootball (Konami soccer video game) campus tournament platform.
+Your task is to analyse the submitted screenshot and extract structured match data.
+
+// ─── FIXTURE CONTEXT ───────────────────────────────────────────────────────
+Home Player: Club="${hId.clubName}" | GameTag="${hId.gameName}" | Initials="${hId.initials}"
+Away Player: Club="${aId.clubName}" | GameTag="${aId.gameName}" | Initials="${aId.initials}"
+
+// ─── WHAT A VALID EFOOTBALL STATS BOARD LOOKS LIKE ────────────────────────
+A VALID eFootball stats board has ALL of these elements:
+  1. SCORE BANNER: Dark navy blue horizontal band. Home name LEFT (yellow bold), Away name RIGHT (yellow bold). Two yellow score boxes flanking the eFootball "e" logo.
+  2. TIMELINE BAR: Solid yellow/gold bar below score banner. Shows: "Full Time", "Full Time (AET)", "Penalty Shootout", "Half Time", or "Interval". ONLY "Full Time", "Full Time (AET)", "Penalty Shootout" are accepted for CEE.
+  3. STATS TABLE: Dark navy 3-column layout: [Home] | [Stat] | [Away]. Rows: Possession, Shots, Shots on Target, Fouls, Offsides, Corner Kicks, Free Kicks, Passes, Successful Passes, Crosses, Interceptions, Tackles, Saves.
+  4. SIDE AREAS: Yellow/gold with diagonal navy chevron pattern. Team badge in centre.
+  5. NAVIGATION button at bottom (cyan): "Next ›" = Full Time or later. "‹ Back" = Half Time.
+
+REJECT (isEfootballStatsBoard=false) if: pause menu, pre-match, in-game HUD, photo of phone, social media, non-efootball.
+
+STEP 1 — Timeline. STEP 2 — Score. STEP 3 — Names + fuzzy match. STEP 4 — Key stats. STEP 5 — Anti-cheat. STEP 6 — Analysis.
+
+homeNameMatch/awayNameMatch: "yes"=80%+, "partial"=50-79%, "no"=below 50%.
+suspiciousScoreToShots: homeGoals>=5 AND shotsOnTargetHome<=1, OR awayGoals>=5 AND shotsOnTargetAway<=1.
+extremeScore: |homeGoals-awayGoals|>=10 OR either>15.
+homeAwaySwap: home name matches AWAY identifiers AND away name matches HOME identifiers.
+
+Respond ONLY with valid JSON. No markdown. No code fences.
+{
+  "isEfootballStatsBoard": true/false,
+  "screenType": "string",
+  "timelineLabel": "string or null",
+  "timelineAccepted": true/false,
+  "homeTeamName": "string or null",
+  "awayTeamName": "string or null",
+  "homeNameMatch": "yes"/"partial"/"no",
+  "awayNameMatch": "yes"/"partial"/"no",
+  "homeGoals": integer or null,
+  "awayGoals": integer or null,
+  "shotsOnTargetHome": integer or null,
+  "shotsOnTargetAway": integer or null,
+  "foulsHome": integer or null,
+  "foulsAway": integer or null,
+  "tacklesHome": integer or null,
+  "tacklesAway": integer or null,
+  "offsidesHome": integer or null,
+  "offsidesAway": integer or null,
+  "suspiciousScoreToShots": false,
+  "extremeScore": false,
+  "homeAwaySwap": false,
+  "matchSummary": "string or null",
+  "homeAnalysis": { "strengths": [], "improvements": [] } or null,
+  "awayAnalysis": { "strengths": [], "improvements": [] } or null,
+  "keyStatInsight": "string or null",
+  "confidence": 0.0-1.0,
+  "rejectionReason": "string or null"
+}`;
     const cr = await fetch(geminiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{ parts: [
-          { inline_data: { mime_type: mimeType || 'image/jpeg', data: screenshotBase64 } },
-          { text: `You are analyzing a screenshot from eFootball (Konami's soccer video game). Your job is to determine if it shows a FINAL post-match result screen with the completed score.\n\nVALID result screens show: final score prominently displayed, both club names/badges, "RESULT" text or post-match stats screen, full-time summary.\n\nNOT valid: pause menu (Game Plan/Camera/Audio/Quit options), half-time screen, pre-match lobby, in-game HUD, any mid-game screen, or non-eFootball images.\n\nRespond ONLY in JSON with no extra text or markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<club name string or null>",\n  "awayClubName": "<club name string or null>",\n  "isPlausibleScore": true/false,\n  "confidence": <float 0.0-1.0>,\n  "screenType": "<what type of screen this is e.g. post-match result, pause menu, half-time, pre-match, non-efootball>"\n}` }
+          { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } },
+          { text: geminiPrompt }
         ]}],
-        generationConfig: { maxOutputTokens: 400, temperature: 0 }
+        generationConfig: { maxOutputTokens: 1200, temperature: 0 }
       })
     });
     const cd = await cr.json();
     const raw = (cd.candidates&&cd.candidates[0]&&cd.candidates[0].content&&cd.candidates[0].content.parts&&cd.candidates[0].content.parts[0]&&cd.candidates[0].content.parts[0].text) || '{}';
     const ai = JSON.parse(raw.replace(/```json|```/g,'').trim());
     const conf = ai.confidence || 0;
-    const expectedA = parseInt(playerAGoals) || 0;
-    const expectedB = parseInt(playerBGoals) || 0;
-    const detectedA = ai.homeGoals !== null && ai.homeGoals !== undefined ? ai.homeGoals : '?';
-    const detectedB = ai.awayGoals !== null && ai.awayGoals !== undefined ? ai.awayGoals : '?';
-    const scoreMatch = (detectedA === expectedA && detectedB === expectedB) || (detectedA === expectedB && detectedB === expectedA);
-    const aiApproved = ai.isEfootballResultScreen && ai.isFullResultScreen && conf >= 0.85 && scoreMatch;
+
+    // Build clue-by-clue breakdown for admin UI
+    const clues = [
+      { id:'C1', name:'Stats Board Structure', passed: ai.isEfootballStatsBoard, detail: ai.screenType||'unknown' },
+      { id:'C2', name:'Timeline Label = Full Time', passed: ai.timelineAccepted, detail: ai.timelineLabel||'unknown' },
+      { id:'C3', name:'Score Readable', passed: ai.homeGoals!==null&&ai.awayGoals!==null, detail: ai.homeGoals!==null ? `${ai.homeGoals}-${ai.awayGoals}` : 'unreadable' },
+      { id:'C4', name:'Home Name Match', passed: ai.homeNameMatch==='yes'||ai.homeNameMatch==='partial', detail: `${ai.homeTeamName||'?'} → ${ai.homeNameMatch}` },
+      { id:'C5', name:'Away Name Match', passed: ai.awayNameMatch==='yes'||ai.awayNameMatch==='partial', detail: `${ai.awayTeamName||'?'} → ${ai.awayNameMatch}` },
+      { id:'C6', name:'Stats Plausibility', passed: !ai.suspiciousScoreToShots&&!ai.extremeScore, detail: ai.suspiciousScoreToShots?'suspicious score/shots':ai.extremeScore?'extreme score':'ok' }
+    ];
+    const passCount = clues.filter(c => c.passed).length;
+    let verdict = 'rejected';
+    if (ai.isEfootballStatsBoard && ai.timelineAccepted) {
+      if (passCount >= 5 && conf >= 0.85) verdict = 'approved';
+      else if (passCount >= 4 || conf >= 0.60) verdict = 'needs_review';
+    }
+
     return res.json({
-      success: true,
-      aiApproved,
-      confidence: conf,
-      detectedScore: `${detectedA} - ${detectedB}`,
-      expectedScore: `${expectedA} - ${expectedB}`,
-      scoreMatch,
-      isEfootballResultScreen: ai.isEfootballResultScreen,
-      isFullResultScreen: ai.isFullResultScreen,
-      homeClubName: ai.homeClubName,
-      awayClubName: ai.awayClubName,
-      aiNotes: ai.isEfootballResultScreen ? (scoreMatch ? 'Score matches expected result' : `Score mismatch: detected ${detectedA}-${detectedB}, expected ${expectedA}-${expectedB}`) : `Not an eFootball result screen — detected: ${ai.screenType || 'unknown screen type'}. Submit the post-match RESULT screen, not the pause menu.`
+      success: true, verdict, confidence: conf, passCount, totalClues: 6,
+      clues, ai, homeIdentifiersUsed: hId, awayIdentifiersUsed: aId,
+      note: 'Admin test tool — results not saved to Firestore'
     });
   } catch(e) {
-    console.error('[CEE] testAiVerify error:', e.message);
+    console.error('[CEE] adminVerifyScreenshot error:', e.message);
     return res.json({ success: false, message: e.message });
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADMIN: LEGACY TEST AI VERIFIER (kept for backwards compat)
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/testAiVerify', async (req, res) => {
+  if (!assertAdminSecret(req, res)) return;
+  // Redirect to the new endpoint internally
+  req.body.imageBase64 = req.body.screenshotBase64;
+  return res.redirect(307, '/adminVerifyScreenshot');
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
