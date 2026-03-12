@@ -81,12 +81,21 @@ function _initVapid() {
   }
   try {
     _vapidPubKeyBuf = Buffer.from(VAPID_PUBLIC_KEY, 'base64url');
-    // Extract x and y from the 65-byte uncompressed EC point (skip 0x04 prefix)
-    const x = _vapidPubKeyBuf.slice(1, 33).toString('base64url');
-    const y = _vapidPubKeyBuf.slice(33, 65).toString('base64url');
+    // Build PKCS#8 DER for P-256 private key from the raw 32-byte private scalar.
+    // Using DER avoids the JWK path which validates d against (x,y) and can fail
+    // with "Invalid JWK EC key" on certain Node builds even with valid keys.
+    // Header = SEQUENCE { version INTEGER 0, AlgorithmIdentifier { ecPublicKey, prime256v1 },
+    //           OCTET STRING { ECPrivateKey SEQUENCE { version 1, OCTET STRING[32] } } }
+    const pkcs8Header = Buffer.from(
+      '3041020100301306072a8648ce3d020106082a8648ce3d030107042730250201010420',
+      'hex'
+    );
+    const privKeyBytes = Buffer.from(VAPID_PRIVATE_KEY, 'base64url');
+    if (privKeyBytes.length !== 32) throw new Error(`Private key must be 32 bytes, got ${privKeyBytes.length}`);
     _vapidPrivKeyObj = crypto.createPrivateKey({
-      key: { kty: 'EC', crv: 'P-256', d: VAPID_PRIVATE_KEY, x, y },
-      format: 'jwk'
+      key:    Buffer.concat([pkcs8Header, privKeyBytes]),
+      format: 'der',
+      type:   'pkcs8'
     });
     console.log('[CEE] VAPID initialized — web push enabled.');
     return true;
@@ -239,7 +248,12 @@ function nowTS()     { return admin.firestore.Timestamp.fromDate(nowWAT().toJSDa
 function assertAdminSecret(req, res) {
   const secret   = env.admin && env.admin.secret;
   const provided = req.headers['x-cee-admin-secret'] || (req.body && req.body._adminSecret);
-  if (!secret || provided !== secret) {
+  // If ADMIN_SECRET is not configured, lock down everything — never open by default
+  if (!secret || secret.trim().length < 6) {
+    res.status(503).json({ success: false, message: 'Admin secret not configured on server. Set ADMIN_SECRET in Railway → Variables.' });
+    return false;
+  }
+  if (!provided || provided !== secret) {
     res.status(403).json({ success: false, message: 'Forbidden' });
     return false;
   }
