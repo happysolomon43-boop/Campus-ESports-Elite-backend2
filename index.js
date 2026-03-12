@@ -320,8 +320,40 @@ function emailHtml(subject, bodyHtml) {
 </div></body></html>`;
 }
 
+// ── Resend.com email (fallback when SMTP is blocked by Railway) ───────────
+// Add RESEND_API_KEY to Railway variables to enable. Free tier = 100 emails/day.
+// Sign up free at resend.com — no credit card needed.
+async function _sendViaResend(to, subject, htmlBody) {
+  const key = process.env.RESEND_API_KEY;
+  if (!key) return null; // not configured
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from:    'CEE League <onboarding@resend.dev>',
+        to:      [to],
+        subject: subject,
+        html:    emailHtml(subject, htmlBody)
+      })
+    });
+    const data = await r.json();
+    if (r.ok) return { success: true, messageId: data.id };
+    return { success: false, error: data.message || 'Resend error' };
+  } catch(e) {
+    return { success: false, error: e.message };
+  }
+}
+
 // ── sendEmail wrapper ─────────────────────────────────────────────────────
 async function sendEmail(to, subject, htmlBody, textBody) {
+  // Try Resend first if configured (works on Railway free plan — SMTP is often blocked)
+  if (process.env.RESEND_API_KEY) {
+    const r = await _sendViaResend(to, subject, htmlBody);
+    if (r && r.success) return r;
+    console.warn('[CEE] Resend failed:', r && r.error, '— falling back to SMTP');
+  }
+  // Fall back to Gmail SMTP
   try {
     const info = await getTransporter().sendMail({
       from: `"CEE League" <${env.gmail.user}>`, to, subject,
@@ -329,10 +361,17 @@ async function sendEmail(to, subject, htmlBody, textBody) {
     });
     return { success: true, messageId: info.messageId };
   } catch (e) {
-    console.error('[CEE] Email error:', e.message);
-    // Reset transporter so next call gets a fresh connection (avoids stuck STARTTLS sessions)
-    _transporter = null;
-    return { success: false, error: e.message };
+    _transporter = null; // reset so next call gets a fresh connection
+    const msg = e.message || '';
+    const isBlocked = msg.includes('ECONNREFUSED') || msg.includes('connect ETIMEDOUT')
+                   || msg.includes('Connection timeout') || msg.includes('ESOCKET')
+                   || msg.includes('getaddrinfo') || msg.includes('timeout');
+    if (isBlocked) {
+      console.error('[CEE] SMTP blocked by Railway. Fix: add RESEND_API_KEY to Railway variables (free at resend.com). Original error:', msg);
+      return { success: false, error: 'SMTP blocked by Railway network. Add RESEND_API_KEY to Railway variables to fix (free at resend.com).' };
+    }
+    console.error('[CEE] Email error:', msg);
+    return { success: false, error: msg };
   }
 }
 
