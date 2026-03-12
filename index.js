@@ -270,19 +270,18 @@ function getTransporter() {
       'Generate one at: myaccount.google.com → Security → 2-Step Verification → App Passwords'
     );
   }
-  if (!_transporter) {
-    _transporter = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 587,
-      secure: false,          // STARTTLS on port 587 (Railway allows this; port 465 SSL is often blocked)
-      requireTLS: true,
-      auth: { user: env.gmail.user, pass: env.gmail.pass },
-      connectionTimeout: 15000,   // 15s — Railway cold start can be slow
-      greetingTimeout:   10000,
-      socketTimeout:     20000,
-      tls: { rejectUnauthorized: false } // tolerate self-signed certs on Railway egress
-    });
-  }
+  // Always create a fresh transporter — never reuse stale connections on Railway
+  _transporter = nodemailer.createTransport({
+    host:   'smtp.gmail.com',
+    port:   465,
+    secure: true,           // SSL on port 465 — more reliable than STARTTLS on Railway
+    auth:   { user: env.gmail.user, pass: env.gmail.pass },
+    connectionTimeout: 20000,
+    greetingTimeout:   15000,
+    socketTimeout:     30000,
+    pool:   false,          // single connection per send — avoids stale socket errors
+    tls:    { rejectUnauthorized: false }
+  });
   return _transporter;
 }
 
