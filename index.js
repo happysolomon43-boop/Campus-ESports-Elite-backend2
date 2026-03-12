@@ -283,7 +283,7 @@ const _brevoAccounts = [];
 for (let i = 1; i <= 4; i++) {
   const key  = process.env[`BREVO_KEY_${i}`];
   const from = process.env[`BREVO_FROM_${i}`];
-  const name = process.env[`BREVO_NAME_${i}`] || 'CEE League';
+  const name = process.env[`BREVO_NAME_${i}`] || process.env.BREVO_NAME_1 || 'CEE League';
   if (key && from) {
     _brevoAccounts.push({ key, from, name, sentToday: 0, lastResetDate: '' });
   }
@@ -2127,7 +2127,7 @@ app.post('/testNotification', async (req, res) => {
           } else {
             const info = await sendEmail(testTo,
               'CEE — Test Email ✅',
-              `<p>✅ Brevo email is working correctly!</p><div class="hl">Sent from: ${acct.from}<br>Account ${_brevoAccounts.indexOf(acct)+1} of ${_brevoAccounts.length} — ${acct.sentToday} emails used today</div>`
+              `<p>✅ Brevo email is working correctly!</p><div class="hl">Sender: ${acct.name}<br>Account ${_brevoAccounts.indexOf(acct)+1} of ${_brevoAccounts.length} — ${acct.sentToday} emails used today</div>`
             );
             results.email = info.success
               ? { ok: true, to: testTo }
