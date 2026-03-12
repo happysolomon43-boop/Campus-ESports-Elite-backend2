@@ -546,11 +546,40 @@ async function _sendMatchNotifications(type, fixtureId, playerAId, playerBId, se
       `📋 <b>Result awaiting approval</b>\nFixture: ${fixtureId}\nAuto-approves in 45 minutes.`).catch(()=>{});
   }
   if (type === 'RESULT_APPROVED') {
-    await both(
-      'CEE — Result Approved ✅',
-      `<p>✅ Your match result has been <strong>approved</strong>!</p><p>Check the updated standings on the CEE website.</p>`,
-      `✅ <b>Match result approved!</b>\nCheck the updated standings on the CEE website.`
-    );
+    // Fetch fixture to get the actual score
+    try {
+      const fixSnap = await db.collection('fixtures').doc(fixtureId).get();
+      const fix = fixSnap.exists ? fixSnap.data() : {};
+      const hg = fix.playerAGoals ?? null, ag = fix.playerBGoals ?? null;
+      const pAName = fix.playerAName || 'Player A';
+      const pBName = fix.playerBName || 'Player B';
+      const hasScore = hg !== null && ag !== null;
+      const scoreLine = hasScore ? `${pAName} <strong>${hg} – ${ag}</strong> ${pBName}` : '';
+      const scoreTg   = hasScore ? `${pAName} ${hg} – ${ag} ${pBName}` : '';
+
+      const winnerA = hasScore && hg > ag, winnerB = hasScore && ag > hg, draw = hasScore && hg === ag;
+
+      // Notify Player A with personalised outcome
+      const outcomeA = winnerA ? '🏆 You won!' : winnerB ? '😔 You lost.' : draw ? '🤝 It\'s a draw.' : '';
+      const htmlA = `<p>✅ Your match result has been <strong>approved</strong>!</p>${hasScore ? `<div class="hl"><strong>${scoreLine}</strong><br>${outcomeA}</div>` : ''}<p>Check the updated standings on the CEE website.</p>`;
+      const tgA   = `✅ <b>Result approved!</b>\n\n${scoreTg ? scoreTg + '\n' + outcomeA + '\n' : ''}Check the updated standings on the CEE website.`;
+
+      // Notify Player B with personalised outcome
+      const outcomeB = winnerB ? '🏆 You won!' : winnerA ? '😔 You lost.' : draw ? '🤝 It\'s a draw.' : '';
+      const htmlB = `<p>✅ Your match result has been <strong>approved</strong>!</p>${hasScore ? `<div class="hl"><strong>${scoreLine}</strong><br>${outcomeB}</div>` : ''}<p>Check the updated standings on the CEE website.</p>`;
+      const tgB   = `✅ <b>Result approved!</b>\n\n${scoreTg ? scoreTg + '\n' + outcomeB + '\n' : ''}Check the updated standings on the CEE website.`;
+
+      await Promise.allSettled([
+        _notifyPlayer(playerAId, fixtureId, type, 'CEE — Result Approved ✅', htmlA, tgA),
+        _notifyPlayer(playerBId, fixtureId, type, 'CEE — Result Approved ✅', htmlB, tgB)
+      ]);
+    } catch(e) {
+      // Fallback to generic if fixture fetch fails
+      await Promise.allSettled([
+        _notifyPlayer(playerAId, fixtureId, type, 'CEE — Result Approved ✅', `<p>✅ Your match result has been <strong>approved</strong>!</p><p>Check the updated standings on the CEE website.</p>`, `✅ <b>Match result approved!</b>\nCheck the updated standings on the CEE website.`),
+        _notifyPlayer(playerBId, fixtureId, type, 'CEE — Result Approved ✅', `<p>✅ Your match result has been <strong>approved</strong>!</p><p>Check the updated standings on the CEE website.</p>`, `✅ <b>Match result approved!</b>\nCheck the updated standings on the CEE website.`)
+      ]);
+    }
   }
   if (type === 'DISPUTE_OPENED') {
     await both(
@@ -3412,6 +3441,56 @@ db.collection('registrations').onSnapshot(snapshot => {
     logNotif(null,regId,'email','REGISTRATION_RECEIVED','sent').catch(()=>{});
   });
 }, err => console.error('[CEE] registrations listener error:', err));
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADMIN: TEST AI VERIFIER (standalone — no fixture required)
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/testAiVerify', async (req, res) => {
+  if (!assertAdminSecret(req, res)) return;
+  const { screenshotBase64, mimeType, playerAGoals, playerBGoals } = req.body;
+  if (!screenshotBase64) return res.status(400).json({ success: false, message: 'Missing screenshotBase64' });
+  try {
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${env.gemini.key}`;
+    const cr = await fetch(geminiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [
+          { inline_data: { mime_type: mimeType || 'image/jpeg', data: screenshotBase64 } },
+          { text: `You are analyzing an eFootball (soccer video game) post-match result screen.\nRespond ONLY in JSON, no other text, no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<club name or null>",\n  "awayClubName": "<club name or null>",\n  "isPlausibleScore": true/false,\n  "confidence": <float 0.0-1.0>\n}\nRules:\n- isEfootballResultScreen: true only if clearly eFootball post-match result screen\n- isFullResultScreen: true only if shows complete final result\n- homeGoals/awayGoals: final score integers, null if not readable\n- isPlausibleScore: false if GD>=10 or either score>20\n- confidence: 1.0=certain, 0.0=cannot read` }
+        ]}],
+        generationConfig: { maxOutputTokens: 300, temperature: 0 }
+      })
+    });
+    const cd = await cr.json();
+    const raw = (cd.candidates&&cd.candidates[0]&&cd.candidates[0].content&&cd.candidates[0].content.parts&&cd.candidates[0].content.parts[0]&&cd.candidates[0].content.parts[0].text) || '{}';
+    const ai = JSON.parse(raw.replace(/```json|```/g,'').trim());
+    const conf = ai.confidence || 0;
+    const expectedA = parseInt(playerAGoals) || 0;
+    const expectedB = parseInt(playerBGoals) || 0;
+    const detectedA = ai.homeGoals !== null && ai.homeGoals !== undefined ? ai.homeGoals : '?';
+    const detectedB = ai.awayGoals !== null && ai.awayGoals !== undefined ? ai.awayGoals : '?';
+    const scoreMatch = (detectedA === expectedA && detectedB === expectedB) || (detectedA === expectedB && detectedB === expectedA);
+    const aiApproved = ai.isEfootballResultScreen && ai.isFullResultScreen && conf >= 0.85 && scoreMatch;
+    return res.json({
+      success: true,
+      aiApproved,
+      confidence: conf,
+      detectedScore: `${detectedA} - ${detectedB}`,
+      expectedScore: `${expectedA} - ${expectedB}`,
+      scoreMatch,
+      isEfootballResultScreen: ai.isEfootballResultScreen,
+      isFullResultScreen: ai.isFullResultScreen,
+      homeClubName: ai.homeClubName,
+      awayClubName: ai.awayClubName,
+      aiNotes: ai.isEfootballResultScreen ? (scoreMatch ? 'Score matches expected result' : `Score mismatch: detected ${detectedA}-${detectedB}, expected ${expectedA}-${expectedB}`) : 'Not an eFootball result screen'
+    });
+  } catch(e) {
+    console.error('[CEE] testAiVerify error:', e.message);
+    return res.json({ success: false, message: e.message });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════
 // START SERVER
