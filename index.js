@@ -984,6 +984,16 @@ app.get('/', (req, res) => res.json({ status:'ok', service:'CEE Backend v2.0 (Ra
 app.get('/health', (req, res) => res.json({ status:'ok', ts: Date.now() }));
 
 // ═══════════════════════════════════════════════════════════════════════════
+// POST /verifyAdminSecret — verifies the x-cee-admin-secret header
+// This is the ONLY endpoint the admin login flow should use to check credentials.
+// Returns 200 + { ok:true } if correct, 403 if wrong, 503 if not configured.
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/verifyAdminSecret', (req, res) => {
+  if (!assertAdminSecret(req, res)) return;
+  return res.json({ ok: true });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // POST /verifyPlayerPin — SEC-1: direct equality queries, LOCKOUT-01
 // ═══════════════════════════════════════════════════════════════════════════
 app.post('/verifyPlayerPin', async (req, res) => {
