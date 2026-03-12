@@ -258,8 +258,15 @@ function getTransporter() {
   }
   if (!_transporter) {
     _transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user: env.gmail.user, pass: env.gmail.pass }
+      host: 'smtp.gmail.com',
+      port: 587,
+      secure: false,          // STARTTLS on port 587 (Railway allows this; port 465 SSL is often blocked)
+      requireTLS: true,
+      auth: { user: env.gmail.user, pass: env.gmail.pass },
+      connectionTimeout: 15000,   // 15s — Railway cold start can be slow
+      greetingTimeout:   10000,
+      socketTimeout:     20000,
+      tls: { rejectUnauthorized: false } // tolerate self-signed certs on Railway egress
     });
   }
   return _transporter;
@@ -310,6 +317,8 @@ async function sendEmail(to, subject, htmlBody, textBody) {
     return { success: true, messageId: info.messageId };
   } catch (e) {
     console.error('[CEE] Email error:', e.message);
+    // Reset transporter so next call gets a fresh connection (avoids stuck STARTTLS sessions)
+    _transporter = null;
     return { success: false, error: e.message };
   }
 }
@@ -2645,8 +2654,58 @@ app.post('/suggestInitials', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// POST /telegramWebhook — /start, /status, /fixtures — SEC-1: direct queries
+// GET /adminHubData?playerId=XXX — Admin test hub: load full hub state for
+// any player without requiring their PIN. Admin secret required.
 // ═══════════════════════════════════════════════════════════════════════════
+app.get('/adminHubData', async (req, res) => {
+  if (!assertAdminSecret(req, res)) return;
+  const playerId = req.query.playerId;
+  if (!playerId) return res.status(400).json({ success: false, message: 'playerId required' });
+  try {
+    const playerSnap = await db.collection('players').doc(playerId).get();
+    if (!playerSnap.exists) return res.status(404).json({ success: false, message: 'Player not found' });
+    const player = { id: playerSnap.id, ...playerSnap.data() };
+    const seasonId = player.seasonId || await getSeasonId();
+
+    // Load fixtures for this player
+    const [fixA, fixB] = await Promise.all([
+      db.collection('fixtures').where('seasonId','==',seasonId).where('playerAId','==',playerId).get(),
+      db.collection('fixtures').where('seasonId','==',seasonId).where('playerBId','==',playerId).get()
+    ]);
+    const fixtures = [];
+    fixA.forEach(d => fixtures.push({ id: d.id, ...d.data() }));
+    fixB.forEach(d => fixtures.push({ id: d.id, ...d.data() }));
+
+    // Load all players for standings context
+    const playersSnap = await db.collection('players').where('seasonId','==',seasonId).get();
+    const allPlayers = [];
+    playersSnap.forEach(d => allPlayers.push({ id: d.id, ...d.data() }));
+
+    return res.json({ success: true, player, fixtures, allPlayers, adminTestMode: true });
+  } catch(e) {
+    console.error('[CEE] adminHubData:', e);
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// GET /adminListPlayers — returns all players for admin hub picker
+app.get('/adminListPlayers', async (req, res) => {
+  if (!assertAdminSecret(req, res)) return;
+  try {
+    const seasonId = await getSeasonId();
+    if (!seasonId) return res.json({ success: true, players: [] });
+    const snap = await db.collection('players').where('seasonId','==',seasonId).get();
+    const players = [];
+    snap.forEach(d => {
+      const p = d.data();
+      players.push({ id: d.id, clubName: p.clubName, gameName: p.gameName, stats: p.stats });
+    });
+    players.sort((a,b) => (a.clubName||a.gameName||'').localeCompare(b.clubName||b.gameName||''));
+    return res.json({ success: true, players });
+  } catch(e) {
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
 app.post('/telegramWebhook', async (req, res) => {
   res.status(200).send('OK'); // always respond 200 immediately
   try {
@@ -3278,6 +3337,39 @@ db.collection('fixtures').onSnapshot(snapshot => {
     console.log(`[CEE] onFixtureApproved: fixture ${docId} approved — recalculating standings`);
     await _recalcStandingsInternal(seasonId).catch(e => console.error('[CEE] listener recalc:', e));
     await _checkKnockoutQualification(seasonId).catch(e => console.error('[CEE] listener knockout:', e));
+
+    // ── BROADCAST: notify ALL season players about this result ──────────────
+    try {
+      const hg = current.playerAGoals ?? 0, ag = current.playerBGoals ?? 0;
+      const pAName = current.playerAName || 'Player A';
+      const pBName = current.playerBName || 'Player B';
+      const resultLine = `${pAName} ${hg} – ${ag} ${pBName}`;
+      const winner = hg > ag ? pAName : ag > hg ? pBName : null;
+      const tgMsg = `📊 <b>Match Result</b>\n\n${resultLine}\n${winner ? `🏆 Winner: <b>${winner}</b>` : '🤝 Draw'}\n\nStandings have been updated. Check the table!`;
+      const allSnap = await db.collection('players').where('seasonId','==',seasonId).get();
+      const broadcastPromises = [];
+      allSnap.forEach(doc => {
+        const p = doc.data(); const pid = doc.id;
+        // Don't double-notify the two players in this fixture (they already get RESULT_APPROVED)
+        if (pid === current.playerAId || pid === current.playerBId) return;
+        // Telegram
+        if (p.telegramChatId && p.notificationsTelegram !== false) {
+          broadcastPromises.push(sendTelegram(p.telegramChatId, tgMsg).catch(()=>{}));
+        }
+        // Web Push
+        if (p.pushSubscription && p.notificationsPush !== false) {
+          let sub; try { sub = typeof p.pushSubscription==='string' ? JSON.parse(p.pushSubscription) : p.pushSubscription; } catch(e){ sub=null; }
+          if (sub) broadcastPromises.push(_sendWebPush(sub, {
+            title: '📊 CEE — Match Result',
+            body: `${resultLine}${winner ? ` • ${winner} wins` : ' • Draw'}`,
+            eventType: 'MATCH_RESULT_BROADCAST',
+            data: { url: `${process.env.SITE_URL||'https://cee-esports.web.app'}#standings` }
+          }).catch(()=>{}));
+        }
+      });
+      await Promise.allSettled(broadcastPromises);
+      console.log(`[CEE] Broadcast result to ${broadcastPromises.length} players for fixture ${docId}`);
+    } catch(e) { console.error('[CEE] broadcast result error:', e.message); }
   });
 }, err => console.error('[CEE] fixtures listener error:', err));
 
