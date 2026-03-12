@@ -9,8 +9,10 @@
  *   FIREBASE_SERVICE_ACCOUNT   Full service-account JSON as one line (no newlines)
  *   FIREBASE_STORAGE_BUCKET    e.g. ceeapp-2007.firebasestorage.app
  *   GEMINI_KEY                 Google AI Studio key (free, gemini-2.0-flash)
- *   GMAIL_USER                 Gmail address for SMTP
- *   GMAIL_PASS                 Gmail App Password
+ *   BREVO_KEY_1                Brevo API key for account #1 (free at app.brevo.com)
+ *   BREVO_FROM_1               Sender email for account #1 (the Gmail you signed up with)
+ *   BREVO_KEY_2                Brevo API key for account #2 (optional, +295 emails/day)
+ *   BREVO_FROM_2               Sender email for account #2
  *   TELEGRAM_TOKEN             Telegram Bot API token
  *   TELEGRAM_ADMIN_CHAT_ID     Admin Telegram chat ID
  *   ADMIN_EMAIL                Admin email address
@@ -30,7 +32,7 @@ const corsMidd     = require('cors');
 const cron         = require('node-cron');
 const admin        = require('firebase-admin');
 const { DateTime } = require('luxon');
-const nodemailer   = require('nodemailer');
+// nodemailer removed — using SendGrid HTTP API (Railway-compatible, no SMTP port needed)
 const crypto       = require('crypto');
 const bcrypt       = require('bcrypt');
 const fetch        = require('node-fetch');
@@ -55,8 +57,7 @@ const storage = admin.storage();
 // ── Environment config (replaces functions.config()) ─────────────────────
 const env = {
   gemini:   { key:           process.env.GEMINI_KEY },
-  gmail:    { user:          process.env.GMAIL_USER,
-              pass:          process.env.GMAIL_PASS },
+  gmail:    { user: null, pass: null }, // kept for legacy reference only — email now uses SendGrid
   telegram: { token:         process.env.TELEGRAM_TOKEN,
               admin_chat_id: process.env.TELEGRAM_ADMIN_CHAT_ID },
   admin:    { email:         process.env.ADMIN_EMAIL,
@@ -212,7 +213,7 @@ _initVapid();
 
 // ── Startup config validation ─────────────────────────────────────────────
 (function _validateConfig() {
-  const required = ['GEMINI_KEY','GMAIL_USER','GMAIL_PASS','TELEGRAM_TOKEN',
+  const required = ['GEMINI_KEY','TELEGRAM_TOKEN',
                     'TELEGRAM_ADMIN_CHAT_ID','ADMIN_EMAIL','ADMIN_SECRET'];
   const missing = required.filter(k => !process.env[k]);
   if (missing.length > 0) {
@@ -260,29 +261,151 @@ function assertAdminSecret(req, res) {
   return true;
 }
 
-// ── Nodemailer transporter (lazy-init) ────────────────────────────────────
-let _transporter = null;
-function getTransporter() {
-  if (!env.gmail || !env.gmail.user || !env.gmail.pass) {
-    throw new Error(
-      'Email not configured. Set GMAIL_USER and GMAIL_PASS in Railway → Variables.\n' +
-      'IMPORTANT: GMAIL_PASS must be a Gmail App Password (16 chars, no spaces), NOT your regular Gmail password.\n' +
-      'Generate one at: myaccount.google.com → Security → 2-Step Verification → App Passwords'
-    );
+// ── Brevo (formerly Sendinblue) multi-account email ──────────────────────
+// Railway-compatible — pure HTTPS port 443, never blocked.
+// Free tier: 300 emails/day per account. 2 accounts = 600 emails/day.
+// No domain needed — works with any Gmail as sender.
+//
+// Setup:
+//   1. Go to app.brevo.com → sign up free with Gmail #1
+//   2. Top-right avatar → SMTP & API → API Keys → Generate key → copy it
+//   3. Repeat with Gmail #2 for a second account
+//   4. Add to Railway → Variables:
+//        BREVO_KEY_1    = your-first-brevo-api-key
+//        BREVO_FROM_1   = gmail1@gmail.com   (the Gmail you signed up with)
+//        BREVO_NAME_1   = CEE League         (sender display name — optional)
+//        BREVO_KEY_2    = your-second-brevo-api-key
+//        BREVO_FROM_2   = gmail2@gmail.com
+//        BREVO_NAME_2   = CEE League
+
+// Build the pool of configured Brevo accounts at startup
+const _brevoAccounts = [];
+for (let i = 1; i <= 4; i++) {
+  const key  = process.env[`BREVO_KEY_${i}`];
+  const from = process.env[`BREVO_FROM_${i}`];
+  const name = process.env[`BREVO_NAME_${i}`] || 'CEE League';
+  if (key && from) {
+    _brevoAccounts.push({ key, from, name, sentToday: 0, lastResetDate: '' });
   }
-  // Always create a fresh transporter — never reuse stale connections on Railway
-  _transporter = nodemailer.createTransport({
-    host:   'smtp.gmail.com',
-    port:   465,
-    secure: true,           // SSL on port 465 — more reliable than STARTTLS on Railway
-    auth:   { user: env.gmail.user, pass: env.gmail.pass },
-    connectionTimeout: 20000,
-    greetingTimeout:   15000,
-    socketTimeout:     30000,
-    pool:   false,          // single connection per send — avoids stale socket errors
-    tls:    { rejectUnauthorized: false }
-  });
-  return _transporter;
+}
+if (_brevoAccounts.length > 0) {
+  console.log(`[CEE] Brevo: ${_brevoAccounts.length} account(s) loaded — up to ${_brevoAccounts.length * 295} emails/day`);
+} else {
+  console.warn('[CEE] Brevo: No accounts configured. Add BREVO_KEY_1 + BREVO_FROM_1 in Railway → Variables.');
+}
+
+// Daily counter reset — resets each account's count at midnight WAT
+function _brevoResetIfNewDay(acct) {
+  const today = nowWAT().toISODate();
+  if (acct.lastResetDate !== today) {
+    acct.sentToday = 0;
+    acct.lastResetDate = today;
+  }
+}
+
+// Pick the next available account under the 295-email soft limit
+// (295 not 300 — small safety buffer)
+function _pickBrevoAccount() {
+  for (const acct of _brevoAccounts) {
+    _brevoResetIfNewDay(acct);
+    if (acct.sentToday < 295) return acct;
+  }
+  return null; // all accounts exhausted for today
+}
+
+// ── HTML email template (CEE branding) ───────────────────────────────────
+function emailHtml(subject, bodyHtml) {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>
+  body{background:#111119;font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:0}
+  .w{max-width:600px;margin:0 auto;background:#1E1E2C;border:1px solid rgba(240,165,0,.18)}
+  .h{background:linear-gradient(135deg,#C8860A,#F0A500);padding:24px 32px}
+  .ht{color:#000;font-size:18px;font-weight:700;letter-spacing:.05em;margin:0}
+  .hs{color:rgba(0,0,0,.65);font-size:11px;letter-spacing:.14em;text-transform:uppercase;margin-top:4px}
+  .b{padding:32px}.b p{color:#BBBBC8;font-size:14px;line-height:1.8;margin:0 0 14px}
+  .b strong{color:#EEEEF8}
+  .hl{background:rgba(240,165,0,.08);border-left:3px solid #F0A500;padding:12px 16px;margin:16px 0;color:#F0A500;font-size:13px}
+  .f{border-top:1px solid rgba(240,165,0,.1);padding:20px 32px;text-align:center}
+  .f p{color:rgba(136,136,160,.5);font-size:11px;margin:0}
+</style></head><body>
+<div class="w">
+<div class="h"><div class="ht">⚡ CEE — Campus eSports Elite</div><div class="hs">${subject}</div></div>
+<div class="b">${bodyHtml}</div>
+<div class="f"><p>Campus eSports Elite · Nigeria Campus League · Automated notification</p></div>
+</div></body></html>`;
+}
+
+// ── Core Brevo send (single account, single email) ───────────────────────
+async function _sendViaBrevo(acct, to, subject, htmlBody) {
+  try {
+    const r = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method:  'POST',
+      headers: {
+        'api-key':      acct.key,
+        'Content-Type': 'application/json',
+        'Accept':       'application/json'
+      },
+      body: JSON.stringify({
+        sender:      { name: acct.name, email: acct.from },
+        to:          [{ email: to }],
+        subject:     subject,
+        htmlContent: emailHtml(subject, htmlBody)
+      })
+    });
+
+    // Brevo returns 201 Created on success
+    if (r.status === 201 || r.status === 200) {
+      acct.sentToday++;
+      console.log(`[CEE] Email sent via Brevo (${acct.from}) to ${to} | today: ${acct.sentToday}/295`);
+      return { success: true };
+    }
+
+    // Parse error
+    let errMsg = `Brevo HTTP ${r.status}`;
+    try {
+      const body = await r.json();
+      errMsg = body.message || body.error || errMsg;
+    } catch(_) {}
+
+    if (r.status === 401) errMsg = 'Brevo API key invalid — check BREVO_KEY in Railway Variables.';
+    if (r.status === 403) errMsg = 'Brevo account not authorised — check your Brevo account is active.';
+    if (r.status === 429) { acct.sentToday = 300; errMsg = 'Brevo daily limit reached for ' + acct.from; }
+
+    return { success: false, error: errMsg };
+  } catch(e) {
+    return { success: false, error: e.message };
+  }
+}
+
+// ── sendEmail — rotates across all configured Brevo accounts ─────────────
+async function sendEmail(to, subject, htmlBody) {
+  if (_brevoAccounts.length === 0) {
+    const msg = 'No Brevo accounts configured. Add BREVO_KEY_1 + BREVO_FROM_1 in Railway → Variables. ' +
+                'Sign up free at app.brevo.com — 300 emails/day per account, no domain needed.';
+    console.error('[CEE] sendEmail:', msg);
+    return { success: false, error: msg };
+  }
+
+  const acct = _pickBrevoAccount();
+  if (!acct) {
+    const msg = `All ${_brevoAccounts.length} Brevo account(s) have reached their 295 email/day limit. ` +
+                'Add a second account (BREVO_KEY_2 + BREVO_FROM_2) or wait until midnight WAT for limits to reset.';
+    console.warn('[CEE] sendEmail:', msg);
+    return { success: false, error: msg };
+  }
+
+  const result = await _sendViaBrevo(acct, to, subject, htmlBody);
+
+  // If this account hit its daily limit, automatically retry with the next available account
+  if (!result.success && (result.error || '').includes('daily limit')) {
+    const fallback = _pickBrevoAccount();
+    if (fallback && fallback !== acct) {
+      console.warn(`[CEE] Account ${acct.from} hit limit — retrying with ${fallback.from}`);
+      return _sendViaBrevo(fallback, to, subject, htmlBody);
+    }
+  }
+
+  return result;
 }
 
 // ── Telegram helper ───────────────────────────────────────────────────────
@@ -320,60 +443,7 @@ function emailHtml(subject, bodyHtml) {
 </div></body></html>`;
 }
 
-// ── Resend.com email (fallback when SMTP is blocked by Railway) ───────────
-// Add RESEND_API_KEY to Railway variables to enable. Free tier = 100 emails/day.
-// Sign up free at resend.com — no credit card needed.
-async function _sendViaResend(to, subject, htmlBody) {
-  const key = process.env.RESEND_API_KEY;
-  if (!key) return null; // not configured
-  try {
-    const r = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        from:    'CEE League <onboarding@resend.dev>',
-        to:      [to],
-        subject: subject,
-        html:    emailHtml(subject, htmlBody)
-      })
-    });
-    const data = await r.json();
-    if (r.ok) return { success: true, messageId: data.id };
-    return { success: false, error: data.message || 'Resend error' };
-  } catch(e) {
-    return { success: false, error: e.message };
-  }
-}
 
-// ── sendEmail wrapper ─────────────────────────────────────────────────────
-async function sendEmail(to, subject, htmlBody, textBody) {
-  // Try Resend first if configured (works on Railway free plan — SMTP is often blocked)
-  if (process.env.RESEND_API_KEY) {
-    const r = await _sendViaResend(to, subject, htmlBody);
-    if (r && r.success) return r;
-    console.warn('[CEE] Resend failed:', r && r.error, '— falling back to SMTP');
-  }
-  // Fall back to Gmail SMTP
-  try {
-    const info = await getTransporter().sendMail({
-      from: `"CEE League" <${env.gmail.user}>`, to, subject,
-      html: emailHtml(subject, htmlBody), text: textBody || subject
-    });
-    return { success: true, messageId: info.messageId };
-  } catch (e) {
-    _transporter = null; // reset so next call gets a fresh connection
-    const msg = e.message || '';
-    const isBlocked = msg.includes('ECONNREFUSED') || msg.includes('connect ETIMEDOUT')
-                   || msg.includes('Connection timeout') || msg.includes('ESOCKET')
-                   || msg.includes('getaddrinfo') || msg.includes('timeout');
-    if (isBlocked) {
-      console.error('[CEE] SMTP blocked by Railway. Fix: add RESEND_API_KEY to Railway variables (free at resend.com). Original error:', msg);
-      return { success: false, error: 'SMTP blocked by Railway network. Add RESEND_API_KEY to Railway variables to fix (free at resend.com).' };
-    }
-    console.error('[CEE] Email error:', msg);
-    return { success: false, error: msg };
-  }
-}
 
 // ── WhatsApp relay helper — generates wa.me link for admin to forward ─────
 // Called alongside email/telegram when a player has a whatsappNumber.
@@ -2044,16 +2114,26 @@ app.post('/testNotification', async (req, res) => {
   // ── Email ──────────────────────────────────────────────────────────────
   if (doEmail) {
     try {
-      if (!env.gmail || !env.gmail.user || !env.gmail.pass) {
-        results.email = { ok:false, error:'GMAIL_USER or GMAIL_PASS not set in Railway environment variables.' };
+      if (_brevoAccounts.length === 0) {
+        results.email = { ok:false, error:'No Brevo accounts configured. Add BREVO_KEY_1 + BREVO_FROM_1 in Railway → Variables. Sign up free at app.brevo.com (300 emails/day, no domain needed).' };
       } else {
-        const t = getTransporter();
-        await t.verify();
-        const info = await sendEmail(env.admin.email || env.gmail.user,
-          'CEE — Test Email ✅',
-          '<p>✅ Gmail SMTP is working correctly. Your email notifications are operational.</p>'
-        );
-        results.email = { ok: true, to: env.admin.email || env.gmail.user, messageId: info && info.messageId };
+        const testTo = env.admin && env.admin.email;
+        if (!testTo) {
+          results.email = { ok:false, error:'ADMIN_EMAIL not set in Railway — needed to know where to send the test email.' };
+        } else {
+          const acct = _pickBrevoAccount();
+          if (!acct) {
+            results.email = { ok:false, error:`All ${_brevoAccounts.length} Brevo account(s) have hit their daily limit. Wait until midnight WAT or add another account.` };
+          } else {
+            const info = await sendEmail(testTo,
+              'CEE — Test Email ✅',
+              `<p>✅ Brevo email is working correctly!</p><div class="hl">Sent from: ${acct.from}<br>Account ${_brevoAccounts.indexOf(acct)+1} of ${_brevoAccounts.length} — ${acct.sentToday} emails used today</div>`
+            );
+            results.email = info.success
+              ? { ok: true, to: testTo }
+              : { ok: false, error: info.error };
+          }
+        }
       }
     } catch(e) {
       results.email = { ok: false, error: e.message };
@@ -2115,10 +2195,10 @@ app.get('/diagnoseNotifications', async (req, res) => {
   if (!assertAdminSecret(req,res)) return;
   const diag = {
     email: {
-      configured: !!(env.gmail && env.gmail.user && env.gmail.pass),
-      user: env.gmail && env.gmail.user ? env.gmail.user : null,
-      passLength: env.gmail && env.gmail.pass ? env.gmail.pass.length : 0,
-      passLooksLikeAppPassword: env.gmail && env.gmail.pass ? env.gmail.pass.replace(/\s/g,'').length === 16 : false,
+      configured: _brevoAccounts.length > 0,
+      accountCount: _brevoAccounts.length,
+      accounts: _brevoAccounts.map(a => ({ from: a.from, sentToday: a.sentToday, remaining: Math.max(0, 295 - a.sentToday) })),
+      dailyCapacity: _brevoAccounts.length * 295,
       adminEmailSet: !!(env.admin && env.admin.email)
     },
     telegram: {
@@ -2155,9 +2235,9 @@ app.get('/diagnoseNotifications', async (req, res) => {
 
   diag.suggestions = [];
   if (!diag.email.configured)
-    diag.suggestions.push('Set GMAIL_USER and GMAIL_PASS in Railway → Variables → New Variable');
-  if (diag.email.configured && !diag.email.passLooksLikeAppPassword)
-    diag.suggestions.push('GMAIL_PASS looks wrong — Gmail App Passwords are exactly 16 characters (no spaces). Generate one at myaccount.google.com → Security → 2-Step Verification → App Passwords');
+    diag.suggestions.push('No Brevo accounts configured. Add BREVO_KEY_1 + BREVO_FROM_1 in Railway → Variables. Sign up free at app.brevo.com — 300 emails/day per account, no domain needed.');
+  if (diag.email.configured && diag.email.accountCount < 2)
+    diag.suggestions.push('Only 1 Brevo account configured (295 emails/day). Add BREVO_KEY_2 + BREVO_FROM_2 with a second account to reach 590 emails/day.');
   if (!diag.telegram.tokenConfigured)
     diag.suggestions.push('Set TELEGRAM_TOKEN in Railway → Variables (get it from @BotFather on Telegram)');
   if (!diag.telegram.adminChatIdSet)
@@ -3565,8 +3645,8 @@ app.listen(PORT, () => {
   const checks = {
     'FIREBASE_SERVICE_ACCOUNT': !!(serviceAccount && serviceAccount.project_id),
     'FIREBASE_STORAGE_BUCKET':  !!process.env.FIREBASE_STORAGE_BUCKET,
-    'GMAIL_USER':               !!process.env.GMAIL_USER,
-    'GMAIL_PASS':               !!(process.env.GMAIL_PASS && process.env.GMAIL_PASS.replace(/\s/g,'').length === 16),
+    'BREVO_KEY_1':              !!process.env.BREVO_KEY_1,
+    'BREVO_FROM_1':             !!process.env.BREVO_FROM_1,
     'TELEGRAM_TOKEN':           !!process.env.TELEGRAM_TOKEN,
     'TELEGRAM_ADMIN_CHAT_ID':   !!process.env.TELEGRAM_ADMIN_CHAT_ID,
     'ADMIN_SECRET':             !!process.env.ADMIN_SECRET,
