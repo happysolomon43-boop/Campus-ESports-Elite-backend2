@@ -1935,7 +1935,7 @@ Required fields:
             {inline_data:{mime_type:mediaType||'image/jpeg',data:imageData}},
             {text:geminiPrompt}
           ]}],
-          generationConfig:{maxOutputTokens:1200,temperature:0,responseMimeType:'application/json'}
+          generationConfig:{maxOutputTokens:2500,temperature:0,responseMimeType:'application/json'}
         })
       });
       const cd=await cr.json();
@@ -4112,7 +4112,7 @@ Respond ONLY with valid JSON. No markdown. No code fences.
           { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } },
           { text: geminiPrompt }
         ]}],
-        generationConfig: { maxOutputTokens: 1200, temperature: 0, responseMimeType: 'application/json' }
+        generationConfig: { maxOutputTokens: 2500, temperature: 0, responseMimeType: 'application/json' }
       })
     });
     const cd = await cr.json();
