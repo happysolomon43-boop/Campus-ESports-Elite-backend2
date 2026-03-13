@@ -1935,12 +1935,24 @@ Required fields:
             {inline_data:{mime_type:mediaType||'image/jpeg',data:imageData}},
             {text:geminiPrompt}
           ]}],
-          generationConfig:{maxOutputTokens:1200,temperature:0}
+          generationConfig:{maxOutputTokens:1200,temperature:0,responseMimeType:'application/json'}
         })
       });
       const cd=await cr.json();
-      const raw=(cd.candidates&&cd.candidates[0]&&cd.candidates[0].content&&cd.candidates[0].content.parts&&cd.candidates[0].content.parts[0]&&cd.candidates[0].content.parts[0].text)||'{}';
-      ai=JSON.parse(raw.replace(/```json|```/g,'').trim());
+      if (cd.error) throw new Error(`Gemini API error: ${cd.error.message||JSON.stringify(cd.error)}`);
+      if (!cd.candidates||!cd.candidates[0]) {
+        const reason=cd.promptFeedback?JSON.stringify(cd.promptFeedback):'No candidates';
+        throw new Error(`Gemini returned no result: ${reason}`);
+      }
+      const cPart=cd.candidates[0];
+      if (!cPart.content||!cPart.content.parts||!cPart.content.parts[0]||!cPart.content.parts[0].text) {
+        throw new Error(`Gemini empty content. Finish reason: ${cPart.finishReason||'unknown'}`);
+      }
+      const rawText=cPart.content.parts[0].text;
+      const cleanedText=rawText.replace(/```json\s*/gi,'').replace(/```\s*/g,'').trim();
+      const jsonMatch=cleanedText.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error('No JSON object in Gemini response');
+      ai=JSON.parse(jsonMatch[0]);
     } catch(aiErr){ console.error('[CEE] Gemini Vision error:',aiErr.message); }
 
     // ── GATE C1: Not a stats board at all ─────────────────────────────────────
@@ -4100,21 +4112,46 @@ Respond ONLY with valid JSON. No markdown. No code fences.
           { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } },
           { text: geminiPrompt }
         ]}],
-        generationConfig: { maxOutputTokens: 1200, temperature: 0 }
+        generationConfig: { maxOutputTokens: 1200, temperature: 0, responseMimeType: 'application/json' }
       })
     });
     const cd = await cr.json();
-    const raw = (cd.candidates&&cd.candidates[0]&&cd.candidates[0].content&&cd.candidates[0].content.parts&&cd.candidates[0].content.parts[0]&&cd.candidates[0].content.parts[0].text) || '{}';
-    const ai = JSON.parse(raw.replace(/```json|```/g,'').trim());
+
+    // ── Detect Gemini API errors before attempting to parse ────────────────
+    if (cd.error) {
+      return res.json({ success: false, message: `Gemini API error: ${cd.error.message || JSON.stringify(cd.error)}` });
+    }
+    if (!cd.candidates || !cd.candidates[0]) {
+      const reason = cd.promptFeedback ? JSON.stringify(cd.promptFeedback) : 'No candidates returned';
+      return res.json({ success: false, message: `Gemini returned no result. ${reason}` });
+    }
+    const candidatePart = cd.candidates[0];
+    if (!candidatePart.content || !candidatePart.content.parts || !candidatePart.content.parts[0] || !candidatePart.content.parts[0].text) {
+      const finishReason = candidatePart.finishReason || 'unknown';
+      return res.json({ success: false, message: `Gemini returned empty content. Finish reason: ${finishReason}. The image may have been blocked by safety filters.` });
+    }
+    const rawText = candidatePart.content.parts[0].text;
+
+    let ai;
+    try {
+      const cleaned = rawText.replace(/```json\s*/gi,'').replace(/```\s*/g,'').trim();
+      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error('No JSON object found in response');
+      ai = JSON.parse(jsonMatch[0]);
+    } catch(parseErr) {
+      return res.json({ success: false, message: `Gemini returned invalid JSON: ${parseErr.message}. Raw response: ${rawText.slice(0, 300)}` });
+    }
     const conf = ai.confidence || 0;
 
     // Build clue-by-clue breakdown for admin UI
+    // NOTE: use ai.homeGoals != null (!=, not !==) to catch both null AND undefined
+    const scoreReadable = ai.homeGoals != null && ai.awayGoals != null;
     const clues = [
-      { id:'C1', name:'Stats Board Structure', passed: ai.isEfootballStatsBoard, detail: ai.screenType||'unknown' },
-      { id:'C2', name:'Timeline Label = Full Time', passed: ai.timelineAccepted, detail: ai.timelineLabel||'unknown' },
-      { id:'C3', name:'Score Readable', passed: ai.homeGoals!==null&&ai.awayGoals!==null, detail: ai.homeGoals!==null ? `${ai.homeGoals}-${ai.awayGoals}` : 'unreadable' },
-      { id:'C4', name:'Home Name Match', passed: ai.homeNameMatch==='yes'||ai.homeNameMatch==='partial', detail: `${ai.homeTeamName||'?'} → ${ai.homeNameMatch}` },
-      { id:'C5', name:'Away Name Match', passed: ai.awayNameMatch==='yes'||ai.awayNameMatch==='partial', detail: `${ai.awayTeamName||'?'} → ${ai.awayNameMatch}` },
+      { id:'C1', name:'Stats Board Structure', passed: !!ai.isEfootballStatsBoard, detail: ai.screenType||'unknown' },
+      { id:'C2', name:'Timeline Label = Full Time', passed: !!ai.timelineAccepted, detail: ai.timelineLabel||'unknown' },
+      { id:'C3', name:'Score Readable', passed: scoreReadable, detail: scoreReadable ? `${ai.homeGoals}-${ai.awayGoals}` : 'unreadable' },
+      { id:'C4', name:'Home Name Match', passed: ai.homeNameMatch==='yes'||ai.homeNameMatch==='partial', detail: `${ai.homeTeamName||'?'} → ${ai.homeNameMatch||'unknown'}` },
+      { id:'C5', name:'Away Name Match', passed: ai.awayNameMatch==='yes'||ai.awayNameMatch==='partial', detail: `${ai.awayTeamName||'?'} → ${ai.awayNameMatch||'unknown'}` },
       { id:'C6', name:'Stats Plausibility', passed: !ai.suspiciousScoreToShots&&!ai.extremeScore, detail: ai.suspiciousScoreToShots?'suspicious score/shots':ai.extremeScore?'extreme score':'ok' }
     ];
     const passCount = clues.filter(c => c.passed).length;
