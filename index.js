@@ -8,7 +8,7 @@
  * ENVIRONMENT VARIABLES — set in Railway dashboard → Variables tab:
  *   FIREBASE_SERVICE_ACCOUNT   Full service-account JSON as one line (no newlines)
  *   FIREBASE_STORAGE_BUCKET    e.g. ceeapp-2007.firebasestorage.app
- *   GEMINI_KEY                 Google AI Studio key (free, gemini-2.0-flash)
+ *   GEMINI_KEY                 Google AI Studio key (free, gemini-2.5-flash)
  *   BREVO_KEY_1                Brevo API key for account #1 (free at app.brevo.com)
  *   BREVO_FROM_1               Sender email for account #1 (the Gmail you signed up with)
  *   BREVO_KEY_2                Brevo API key for account #2 (optional, +295 emails/day)
@@ -1836,7 +1836,7 @@ app.post('/submitScore', async (req, res) => {
       confidence:0, rejectionReason:null
     };
     try {
-      const geminiUrl=`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${env.gemini.key}`;
+      const geminiUrl=`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.gemini.key}`;
       const geminiPrompt=`You are the CEE (Campus eSports Elite) AI Match Verifier.
 CEE is a competitive eFootball (Konami soccer video game) campus tournament platform.
 Your task is to analyse the submitted screenshot and extract structured match data.
@@ -4048,7 +4048,7 @@ app.post('/adminVerifyScreenshot', async (req, res) => {
       } catch(fErr){ console.error('[CEE] adminVerifyScreenshot fixture load:', fErr.message); }
     }
 
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${env.gemini.key}`;
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.gemini.key}`;
     const geminiPrompt=`You are the CEE (Campus eSports Elite) AI Match Verifier.
 CEE is a competitive eFootball (Konami soccer video game) campus tournament platform.
 Your task is to analyse the submitted screenshot and extract structured match data.
