@@ -114,7 +114,7 @@ function _pickGeminiKey() {
 }
 
 function _geminiUrl(k) {
-  return `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${k.key}`;
+  return `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${k.key}`;
 }
 
 // ── Gemini 2.5 Pro — used ONLY for scout analysis (large context text tasks) ─
@@ -4493,10 +4493,10 @@ Opponent scouted  : ${oppPlayer.clubName} | Matches analysed: ${matchesAnalysed}
 Every fix in the upgrade plan must be actionable for ${reqPlayer.clubName} specifically.
 `;
 
-    // ── Call 1 — Main Analysis (uses Gemini Pro for large context) ──────────────────────────────────────────
+    // ── Call 1 — Main Analysis ──────────────────────────────────────────────
     let reportText = '';
     try {
-      const _gr1 = await _geminiProPost({
+      const _gr1 = await _geminiPost({
           contents: [{ parts: [{ text: fullPrompt }] }],
           generationConfig: { maxOutputTokens:8000, temperature: 0 }
         });
@@ -4583,7 +4583,7 @@ Opponent scouted: ${opponentName || 'unknown'} | Matches analysed: ${matchesAnal
 
 MATCH ANALYSIS:
 `;
-    const _gr2 = await _geminiProPost({
+    const _gr2 = await _geminiPost({
       contents: [{ parts: [{ text: upgradeSubPrompt + reportText }] }],
       generationConfig: { maxOutputTokens: 5000, temperature: 0 }
     });
