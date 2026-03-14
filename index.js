@@ -2656,6 +2656,38 @@ app.post('/unblockPlayer', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ── Admin: Generate VAPID keys (one-shot — copy output to Railway env vars) ──
+app.get('/adminGenerateVapidKeys', (req, res) => {
+  if (!assertAdminSecret(req, res)) return;
+  try {
+    const { generateKeyPairSync } = require('crypto');
+    const { publicKey, privateKey } = generateKeyPairSync('ec', {
+      namedCurve: 'prime256v1',
+      publicKeyEncoding:  { type: 'spki',  format: 'der' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'der' }
+    });
+    // Raw 65-byte public key (last 65 bytes of SPKI DER) encoded as base64url
+    const pubKeyBase64url  = publicKey.slice(-65).toString('base64url');
+    // Raw 32-byte private scalar (last 32 bytes of PKCS8 DER) encoded as base64url
+    const privKeyBase64url = privateKey.slice(-32).toString('base64url');
+    res.json({
+      success: true,
+      message: 'Copy these two values to Railway → Variables. Then redeploy.',
+      VAPID_PUBLIC_KEY:  pubKeyBase64url,
+      VAPID_PRIVATE_KEY: privKeyBase64url,
+      instructions: [
+        '1. Go to Railway → your backend service → Variables',
+        '2. Set VAPID_PUBLIC_KEY = ' + pubKeyBase64url,
+        '3. Set VAPID_PRIVATE_KEY = ' + privKeyBase64url,
+        '4. Click Deploy',
+        '5. Come back and click Enable Push — it will work'
+      ]
+    });
+  } catch(e) {
+    res.json({ success: false, message: e.message });
+  }
+});
 // GET /vapidPublicKey — frontend calls this once on load to get the VAPID key
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/vapidPublicKey', (req, res) => {
@@ -5593,7 +5625,7 @@ app.post('/testAiVerify', async (req, res) => {
     const _gr3 = await _geminiPost({
         contents: [{ parts: [
           { inline_data: { mime_type: mimeType || 'image/jpeg', data: screenshotBase64 } },
-          { text: 'This is a screenshot from an eFootball video game. Read the final score and team names from the results screen.\nRespond ONLY in JSON with no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<string or null>",\n  "awayClubName": "<string or null>",\n  "isPlausibleScore": true/false,\n  "imageQualityScore": <float 0.0-1.0>,\n  "uiMatchScore": <float 0.0-1.0>,\n  "readingIssues": [],\n  "statAnomalies": [],\n  "confidence": <float 0.0-1.0>\n}\nNotes:\n- isPlausibleScore: false only if goal difference >= 10 or either score > 20\n- imageQualityScore: how clearly the image can be read (1.0 = perfect)\n- uiMatchScore: how closely this matches a real eFootball results screen\n- readingIssues: list any parts of the screen that were hard to read\n- confidence: overall certainty all values are correct' }
+          { text: 'You are the CEE Anti-Cheat Vision System. Analyse this screenshot for fraud and extract stats.\n\nPART 1 — FRAUD DETECTION:\nExamine for signs of image editing, statistical impossibilities, UI inconsistencies, and score implausibility. Reason from what you see.\n\nPART 2 — STAT EXTRACTION:\nExtract every number precisely.\n\nRespond ONLY in JSON with no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<string or null>",\n  "awayClubName": "<string or null>",\n  "isPlausibleScore": true/false,\n  "confidence": <float 0.0-1.0>,\n  "fraudSuspicion": <float 0.0-1.0>,\n  "fraudIndicators": [<specific suspicious observations, empty if none>],\n  "statAnomalies": [<mathematically inconsistent stats, empty if none>],\n  "readingIssues": [<parts that were hard to read, empty if none>],\n  "uiAuthenticityScore": <float 0.0-1.0>,\n  "imageQualityScore": <float 0.0-1.0>\n}\nRules:\n- fraudSuspicion: 0.0=definitely real, 1.0=definitely fake. Be precise.\n- fraudIndicators: list every visual/structural anomaly you detect.\n- uiAuthenticityScore: how closely this matches a genuine eFootball post-match stats screen.\n- isPlausibleScore: false if goal difference >= 8 or either score > 15.\n- confidence: certainty all values were read correctly.' }
         ]}],
         generationConfig: { maxOutputTokens:8000, temperature: 0 }
       });
@@ -5614,17 +5646,24 @@ app.post('/testAiVerify', async (req, res) => {
     const detectedB = ai.awayGoals !== null && ai.awayGoals !== undefined ? ai.awayGoals : '?';
     const imgQuality = ai.imageQualityScore || ai.uiMatchScore || conf;
     const aiApproved = ai.isEfootballResultScreen && ai.isFullResultScreen && conf >= 0.85;
+    const fraudSusp   = ai.fraudSuspicion != null ? ai.fraudSuspicion : 0;
+    const uiAuth      = ai.uiAuthenticityScore != null ? ai.uiAuthenticityScore : 1.0;
+    const fraudInds   = Array.isArray(ai.fraudIndicators) ? ai.fraudIndicators : [];
+    const statAnoms   = Array.isArray(ai.statAnomalies)   ? ai.statAnomalies   : [];
+    const readIssues  = Array.isArray(ai.readingIssues)   ? ai.readingIssues   : [];
     return res.json({
       success: true,
       aiApproved,
       confidence: conf,
       detectedScore: `${detectedA} - ${detectedB}`,
-      imageQualityScore: ai.imageQualityScore || conf,
-      uiMatchScore: ai.uiMatchScore || 1,
-      readingIssues: ai.readingIssues || [],
-      statAnomalies: ai.statAnomalies || [],
+      fraudSuspicion:       fraudSusp,
+      fraudIndicators:      fraudInds,
+      statAnomalies:        statAnoms,
+      readingIssues:        readIssues,
+      uiAuthenticityScore:  uiAuth,
+      imageQualityScore:    ai.imageQualityScore || conf,
       isEfootballResultScreen: ai.isEfootballResultScreen,
-      isFullResultScreen: ai.isFullResultScreen,
+      isFullResultScreen:      ai.isFullResultScreen,
       homeClubName: ai.homeClubName,
       awayClubName: ai.awayClubName,
       aiNotes: !ai.isEfootballResultScreen ? 'Not an eFootball result screen' : conf >= 0.85 ? 'Screenshot read successfully' : 'Low confidence — try a clearer screenshot'
