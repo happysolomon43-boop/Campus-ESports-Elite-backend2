@@ -5502,7 +5502,7 @@ app.post('/testAiVerify', async (req, res) => {
     const _gr3 = await _geminiPost({
         contents: [{ parts: [
           { inline_data: { mime_type: mimeType || 'image/jpeg', data: screenshotBase64 } },
-          { text: 'You are analyzing an eFootball post-match result screen.\nRespond ONLY in JSON, no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<string or null>",\n  "awayClubName": "<string or null>",\n  "isPlausibleScore": true/false,\n  "fraudSuspicion": <float 0.0-1.0>,\n  "uiAuthenticityScore": <float 0.0-1.0>,\n  "fraudIndicators": [],\n  "statisticalAnomalies": [],\n  "confidence": <float 0.0-1.0>\n}' }
+          { text: 'This is a screenshot from an eFootball video game. Read the final score and team names from the results screen.\nRespond ONLY in JSON with no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<string or null>",\n  "awayClubName": "<string or null>",\n  "isPlausibleScore": true/false,\n  "imageQualityScore": <float 0.0-1.0>,\n  "uiMatchScore": <float 0.0-1.0>,\n  "readingIssues": [],\n  "statAnomalies": [],\n  "confidence": <float 0.0-1.0>\n}\nNotes:\n- isPlausibleScore: false only if goal difference >= 10 or either score > 20\n- imageQualityScore: how clearly the image can be read (1.0 = perfect)\n- uiMatchScore: how closely this matches a real eFootball results screen\n- readingIssues: list any parts of the screen that were hard to read\n- confidence: overall certainty all values are correct' }
         ]}],
         generationConfig: { maxOutputTokens: 500, temperature: 0 }
       });
@@ -5512,22 +5512,26 @@ app.post('/testAiVerify', async (req, res) => {
       return res.json({ success: false, message: 'Gemini returned empty response — your API key may have hit quota. Check Railway logs.' });
     }
     let ai;
-    try { ai = JSON.parse(rawText.replace(/```json|```/g,'').trim()); }
-    catch(pe) { return res.json({ success: false, message: 'Could not parse Gemini response: ' + pe.message }); }
+    const cleanedText = rawText.replace(/```json|```/g,'').trim();
+    if (!cleanedText) {
+      return res.json({ success: false, message: 'Gemini returned a response but no JSON content — quota may be hit or image was blocked by safety filters. Check Railway logs.' });
+    }
+    try { ai = JSON.parse(cleanedText); }
+    catch(pe) { return res.json({ success: false, message: 'Gemini response parse error: ' + pe.message + ' | Raw: ' + rawText.substring(0,80) }); }
     const conf = ai.confidence || 0;
     const detectedA = ai.homeGoals !== null && ai.homeGoals !== undefined ? ai.homeGoals : '?';
     const detectedB = ai.awayGoals !== null && ai.awayGoals !== undefined ? ai.awayGoals : '?';
-    const fraud = ai.fraudSuspicion || 0;
-    const aiApproved = ai.isEfootballResultScreen && ai.isFullResultScreen && conf >= 0.85 && fraud < 0.45;
+    const imgQuality = ai.imageQualityScore || ai.uiMatchScore || conf;
+    const aiApproved = ai.isEfootballResultScreen && ai.isFullResultScreen && conf >= 0.85;
     return res.json({
       success: true,
       aiApproved,
       confidence: conf,
       detectedScore: `${detectedA} - ${detectedB}`,
-      fraudSuspicion: fraud,
-      uiAuthenticityScore: ai.uiAuthenticityScore || 1,
-      fraudIndicators: ai.fraudIndicators || [],
-      statisticalAnomalies: ai.statisticalAnomalies || [],
+      imageQualityScore: ai.imageQualityScore || conf,
+      uiMatchScore: ai.uiMatchScore || 1,
+      readingIssues: ai.readingIssues || [],
+      statAnomalies: ai.statAnomalies || [],
       isEfootballResultScreen: ai.isEfootballResultScreen,
       isFullResultScreen: ai.isFullResultScreen,
       homeClubName: ai.homeClubName,
