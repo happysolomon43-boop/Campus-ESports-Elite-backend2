@@ -5111,7 +5111,7 @@ Every fix in the upgrade plan must be actionable for ${reqPlayer.clubName} speci
 `;
 
     // ── Call 1 — Main Analysis ──────────────────────────────────────────────
-    let reportText = '', upgradeText = '';
+    let reportText = '';
     try {
       const _gr1 = await _geminiPost({
           contents: [{ parts: [{ text: fullPrompt }] }],
@@ -5129,8 +5129,7 @@ Every fix in the upgrade plan must be actionable for ${reqPlayer.clubName} speci
       return res.json({ success: false, reason: 'ai_unavailable', message: 'Analysis engine is temporarily unavailable. Please try again shortly.' });
     }
 
-    // ── Cache the report (Call 2 / upgrade plan fetched separately by frontend) ──
-    const upgradeText = ''; // frontend calls /analyzeOpponentUpgrade separately
+    // ── Cache the report (upgrade plan fetched separately by frontend via /analyzeOpponentUpgrade) ──
     const reportDoc = {
       requestingPlayerId, opponentPlayerId, seasonId,
       generatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -5154,7 +5153,7 @@ Every fix in the upgrade plan must be actionable for ${reqPlayer.clubName} speci
       success: true,
       cached: false,
       reportText,
-      upgradeText,
+      upgradeText: '',
       matchesAnalysed,
       opponentName: oppPlayer.clubName || oppPlayer.gameName,
       generatedAt: new Date().toISOString()
