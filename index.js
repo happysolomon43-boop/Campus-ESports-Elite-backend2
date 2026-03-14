@@ -1,4 +1,3 @@
-
 /**
  * ═══════════════════════════════════════════════════════════════════════════
  * CEE — CAMPUS eSPORTS ELITE
@@ -2663,15 +2662,20 @@ app.get('/adminGenerateVapidKeys', (req, res) => {
   if (!assertAdminSecret(req, res)) return;
   try {
     const { generateKeyPairSync } = require('crypto');
-    const { publicKey, privateKey } = generateKeyPairSync('ec', {
-      namedCurve: 'prime256v1',
-      publicKeyEncoding:  { type: 'spki',  format: 'der' },
-      privateKeyEncoding: { type: 'pkcs8', format: 'der' }
-    });
-    // Raw 65-byte public key (last 65 bytes of SPKI DER) encoded as base64url
-    const pubKeyBase64url  = publicKey.slice(-65).toString('base64url');
-    // Raw 32-byte private scalar (last 32 bytes of PKCS8 DER) encoded as base64url
-    const privKeyBase64url = privateKey.slice(-32).toString('base64url');
+    // Generate EC P-256 key pair — use JWK export to get exact private scalar (d)
+    // and build uncompressed public key from x,y coordinates.
+    // DO NOT use slice(-32) on PKCS8 DER — it extracts wrong bytes (end of public key).
+    const keyPair = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const jwk = keyPair.privateKey.export({ format: 'jwk' });
+    // Private scalar: jwk.d is already base64url-encoded 32-byte scalar
+    const privKeyBase64url = jwk.d;
+    // Public key: uncompressed point 0x04 || x || y = 65 bytes
+    const pubKey65 = Buffer.concat([
+      Buffer.from([0x04]),
+      Buffer.from(jwk.x, 'base64url'),
+      Buffer.from(jwk.y, 'base64url')
+    ]);
+    const pubKeyBase64url = pubKey65.toString('base64url');
     res.json({
       success: true,
       message: 'Copy these two values to Railway → Variables. Then redeploy.',
