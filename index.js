@@ -1,3 +1,108 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * CEE — CAMPUS eSPORTS ELITE
+ * Express Backend v2.0 — Railway (Node.js 18)
+ * Converted from Firebase Cloud Functions (3018-line source, all fixes included)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * ENVIRONMENT VARIABLES — set in Railway dashboard → Variables tab:
+ *   FIREBASE_SERVICE_ACCOUNT   Full service-account JSON as one line (no newlines)
+ *   FIREBASE_STORAGE_BUCKET    e.g. ceeapp-2007.firebasestorage.app
+ *   GEMINI_KEY_1               Google AI Studio key #1 (primary)
+ *   GEMINI_KEY_2               Google AI Studio key #2 (optional, rotates when #1 hits quota)
+ *   GEMINI_KEY_3               Google AI Studio key #3 (optional)
+ *   GEMINI_KEY_4               Google AI Studio key #4 (optional)
+ *                               Get free keys at aistudio.google.com — 1500 req/day each
+ *   BREVO_KEY_1                Brevo API key for account #1 (free at app.brevo.com)
+ *   BREVO_FROM_1               Sender email for account #1 (the Gmail you signed up with)
+ *   BREVO_KEY_2                Brevo API key for account #2 (optional, +295 emails/day)
+ *   BREVO_FROM_2               Sender email for account #2
+ *   TELEGRAM_TOKEN             Telegram Bot API token
+ *   TELEGRAM_ADMIN_CHAT_ID     Admin Telegram chat ID
+ *   ADMIN_EMAIL                Admin email address
+ *   ADMIN_PLAYER_ID            Admin player doc ID (optional)
+ *   ADMIN_SECRET               Strong random string — guards all admin endpoints
+ *   PAYSTACK_SECRET            sk_live_... or sk_test_... (blank = test/bypass mode)
+ *   PORT                       Set automatically by Railway — do NOT set manually
+ *
+ * TELEGRAM WEBHOOK (run once after deploy):
+ *   curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<railway-url>/telegramWebhook"
+ */
+
+'use strict';
+
+const express      = require('express');
+const corsMidd     = require('cors');
+const cron         = require('node-cron');
+const admin        = require('firebase-admin');
+const { DateTime } = require('luxon');
+// nodemailer removed — using SendGrid HTTP API (Railway-compatible, no SMTP port needed)
+const crypto       = require('crypto');
+const bcrypt       = require('bcrypt');
+const fetch        = require('node-fetch');
+
+// ── Firebase Admin init ───────────────────────────────────────────────────
+let serviceAccount;
+try {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT || '{}';
+  serviceAccount = JSON.parse(raw);
+} catch(e) {
+  console.error('[CEE] FATAL: FIREBASE_SERVICE_ACCOUNT is not valid JSON:', e.message);
+  console.error('[CEE] Make sure the value in Railway has no line breaks and is a single-line JSON string.');
+  serviceAccount = {};
+}
+admin.initializeApp({
+  credential:    admin.credential.cert(serviceAccount),
+  storageBucket: process.env.FIREBASE_STORAGE_BUCKET || ''
+});
+const db      = admin.firestore();
+const storage = admin.storage();
+
+// ── Environment config (replaces functions.config()) ─────────────────────
+const env = {
+  gemini:   { key: process.env.GEMINI_KEY_1 || process.env.GEMINI_KEY }, // legacy GEMINI_KEY still works
+  gmail:    { user: null, pass: null }, // kept for legacy reference only — email now uses SendGrid
+  telegram: { token:         process.env.TELEGRAM_TOKEN,
+              admin_chat_id: process.env.TELEGRAM_ADMIN_CHAT_ID },
+  admin:    { email:         process.env.ADMIN_EMAIL,
+              player_id:     process.env.ADMIN_PLAYER_ID,
+              secret:        process.env.ADMIN_SECRET },
+  paystack: { secret:        process.env.PAYSTACK_SECRET }
+};
+
+// ── Gemini key pool — rotates across up to 4 keys (mirrors Brevo strategy) ────────
+// Each key is a free Google AI Studio key (1500 req/day).
+// 4 keys = up to 6000 Gemini calls/day across all features.
+// Set GEMINI_KEY_1 through GEMINI_KEY_4 in Railway → Variables.
+// GEMINI_KEY (no suffix) is also accepted as a legacy alias for key #1.
+const _geminiKeys = [];
+for (let _gi = 1; _gi <= 4; _gi++) {
+  const _k = process.env[`GEMINI_KEY_${_gi}`] || (_gi === 1 ? process.env.GEMINI_KEY : null);
+  if (_k && _k.trim()) _geminiKeys.push({ key: _k.trim(), callsToday: 0, lastResetDate: '' });
+}
+if (_geminiKeys.length > 0) {
+  console.log(`[CEE] Gemini: ${_geminiKeys.length} key(s) loaded — up to ${_geminiKeys.length * 1500} req/day`);
+} else {
+  console.warn('[CEE] Gemini: No keys configured. Add GEMINI_KEY_1 in Railway → Variables (free at aistudio.google.com).');
+}
+
+let _geminiRoundRobinIdx = 0;
+
+function _resetGeminiKeyIfNewDay(k) {
+  const today = nowWAT().toISODate();
+  if (k.lastResetDate !== today) {
+    k.exhausted = false;    // new day — quota resets regardless of what it was
+    k.callsToday = 0;
+    k.lastResetDate = today;
+  }
+}
+
+// Pick next available key using round-robin — skips keys marked exhausted today
+// No hardcoded quota limit: exhausted flag is ONLY set when the API returns 429.
+function _pickGeminiKey() {
+  if (!_geminiKeys.length) return null;
+  for (let attempt = 0; attempt < _geminiKeys.length; attempt++) {
+    const idx = (_geminiRoundRobinIdx + attempt) % _geminiKeys.length;
     const k = _geminiKeys[idx];
     _resetGeminiKeyIfNewDay(k);
     if (!k.exhausted) {
@@ -5314,6 +5419,56 @@ app.get('/getScoutReport', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /approveResult — Admin approves a match result
+// Marks fixture approved, notifies both players, triggers standings recalc.
+// Called from admin Result Queue and arbitration panel in frontend.
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/approveResult', async (req, res) => {
+  if (!assertAdminSecret(req, res)) return;
+  const { fixtureId } = req.body;
+  if (!fixtureId) return res.status(400).json({ success: false, message: 'Missing fixtureId' });
+  try {
+    const fixRef  = db.collection('fixtures').doc(fixtureId);
+    const fixSnap = await fixRef.get();
+    if (!fixSnap.exists) return res.json({ success: false, message: 'Fixture not found' });
+    const fix = fixSnap.data();
+
+    // Extract score from whichever submission exists
+    const hg = fix.playerAGoals ?? fix.aiExtractedA?.home ?? null;
+    const ag = fix.playerBGoals ?? fix.aiExtractedA?.away ?? null;
+
+    // Mark approved
+    await fixRef.update({
+      status: 'approved',
+      adminApproved: true,
+      done: true,
+      adminApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
+      playerAGoals: hg,
+      playerBGoals: ag
+    });
+
+    // Notify both players
+    await _handleNotification('RESULT_APPROVED', fixtureId, fix.playerAId, fix.playerBId);
+
+    // Recalculate standings
+    const seasonId = fix.seasonId || await getSeasonId();
+    if (seasonId) {
+      recalculateStandings(seasonId).catch(e =>
+        console.error('[CEE] approveResult standings error:', e.message)
+      );
+    }
+
+    await audit('ADMIN_APPROVE_RESULT', fixtureId, 'fixture',
+      `Admin manually approved result: ${hg ?? '?'}-${ag ?? '?'}`);
+
+    return res.json({ success: true, message: 'Result approved. Players notified.' });
+  } catch(e) {
+    console.error('[CEE] approveResult error:', e.message);
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // POST /adminSetIntelligenceConfig — admin enable/disable switch
 // ═══════════════════════════════════════════════════════════════════════════
 app.post('/adminSetIntelligenceConfig', async (req, res) => {
