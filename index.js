@@ -5496,38 +5496,43 @@ app.get('/adminGetIntelligenceConfig', async (req, res) => {
 
 app.post('/testAiVerify', async (req, res) => {
   if (!assertAdminSecret(req, res)) return;
-  const { screenshotBase64, mimeType, playerAGoals, playerBGoals } = req.body;
+  const { screenshotBase64, mimeType } = req.body;
   if (!screenshotBase64) return res.status(400).json({ success: false, message: 'Missing screenshotBase64' });
   try {
     const _gr3 = await _geminiPost({
         contents: [{ parts: [
           { inline_data: { mime_type: mimeType || 'image/jpeg', data: screenshotBase64 } },
-          { text: `You are analyzing an eFootball (soccer video game) post-match result screen.\nRespond ONLY in JSON, no other text, no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<club name or null>",\n  "awayClubName": "<club name or null>",\n  "isPlausibleScore": true/false,\n  "confidence": <float 0.0-1.0>\n}\nRules:\n- isEfootballResultScreen: true only if clearly eFootball post-match result screen\n- isFullResultScreen: true only if shows complete final result\n- homeGoals/awayGoals: final score integers, null if not readable\n- isPlausibleScore: false if GD>=10 or either score>20\n- confidence: 1.0=certain, 0.0=cannot read` }
+          { text: 'You are analyzing an eFootball post-match result screen.\nRespond ONLY in JSON, no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<string or null>",\n  "awayClubName": "<string or null>",\n  "isPlausibleScore": true/false,\n  "fraudSuspicion": <float 0.0-1.0>,\n  "uiAuthenticityScore": <float 0.0-1.0>,\n  "fraudIndicators": [],\n  "statisticalAnomalies": [],\n  "confidence": <float 0.0-1.0>\n}' }
         ]}],
-        generationConfig: { maxOutputTokens: 300, temperature: 0 }
+        generationConfig: { maxOutputTokens: 500, temperature: 0 }
       });
     if (!_gr3.ok) throw new Error(_gr3.error || 'Gemini Vision call failed');
-    const raw = (_gr3.data.candidates&&_gr3.data.candidates[0]&&_gr3.data.candidates[0].content&&_gr3.data.candidates[0].content.parts&&_gr3.data.candidates[0].content.parts[0]&&_gr3.data.candidates[0].content.parts[0].text) || '{}';
-    const ai = JSON.parse(raw.replace(/```json|```/g,'').trim());
+    const rawText = (_gr3.data.candidates&&_gr3.data.candidates[0]&&_gr3.data.candidates[0].content&&_gr3.data.candidates[0].content.parts&&_gr3.data.candidates[0].content.parts[0]&&_gr3.data.candidates[0].content.parts[0].text) || '';
+    if (!rawText || !rawText.trim()) {
+      return res.json({ success: false, message: 'Gemini returned empty response — your API key may have hit quota. Check Railway logs.' });
+    }
+    let ai;
+    try { ai = JSON.parse(rawText.replace(/```json|```/g,'').trim()); }
+    catch(pe) { return res.json({ success: false, message: 'Could not parse Gemini response: ' + pe.message }); }
     const conf = ai.confidence || 0;
-    const expectedA = parseInt(playerAGoals) || 0;
-    const expectedB = parseInt(playerBGoals) || 0;
     const detectedA = ai.homeGoals !== null && ai.homeGoals !== undefined ? ai.homeGoals : '?';
     const detectedB = ai.awayGoals !== null && ai.awayGoals !== undefined ? ai.awayGoals : '?';
-    const scoreMatch = (detectedA === expectedA && detectedB === expectedB) || (detectedA === expectedB && detectedB === expectedA);
-    const aiApproved = ai.isEfootballResultScreen && ai.isFullResultScreen && conf >= 0.85 && scoreMatch;
+    const fraud = ai.fraudSuspicion || 0;
+    const aiApproved = ai.isEfootballResultScreen && ai.isFullResultScreen && conf >= 0.85 && fraud < 0.45;
     return res.json({
       success: true,
       aiApproved,
       confidence: conf,
       detectedScore: `${detectedA} - ${detectedB}`,
-      expectedScore: `${expectedA} - ${expectedB}`,
-      scoreMatch,
+      fraudSuspicion: fraud,
+      uiAuthenticityScore: ai.uiAuthenticityScore || 1,
+      fraudIndicators: ai.fraudIndicators || [],
+      statisticalAnomalies: ai.statisticalAnomalies || [],
       isEfootballResultScreen: ai.isEfootballResultScreen,
       isFullResultScreen: ai.isFullResultScreen,
       homeClubName: ai.homeClubName,
       awayClubName: ai.awayClubName,
-      aiNotes: ai.isEfootballResultScreen ? (scoreMatch ? 'Score matches expected result' : `Score mismatch: detected ${detectedA}-${detectedB}, expected ${expectedA}-${expectedB}`) : 'Not an eFootball result screen'
+      aiNotes: !ai.isEfootballResultScreen ? 'Not an eFootball result screen' : conf >= 0.85 ? 'Screenshot read successfully' : 'Low confidence — try a clearer screenshot'
     });
   } catch(e) {
     console.error('[CEE] testAiVerify error:', e.message);
