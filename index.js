@@ -8,7 +8,11 @@
  * ENVIRONMENT VARIABLES — set in Railway dashboard → Variables tab:
  *   FIREBASE_SERVICE_ACCOUNT   Full service-account JSON as one line (no newlines)
  *   FIREBASE_STORAGE_BUCKET    e.g. ceeapp-2007.firebasestorage.app
- *   GEMINI_KEY                 Google AI Studio key (free, gemini-2.5-flash)
+ *   GEMINI_KEY_1               Google AI Studio key #1 (primary)
+ *   GEMINI_KEY_2               Google AI Studio key #2 (optional, rotates when #1 hits quota)
+ *   GEMINI_KEY_3               Google AI Studio key #3 (optional)
+ *   GEMINI_KEY_4               Google AI Studio key #4 (optional)
+ *                               Get free keys at aistudio.google.com — 1500 req/day each
  *   BREVO_KEY_1                Brevo API key for account #1 (free at app.brevo.com)
  *   BREVO_FROM_1               Sender email for account #1 (the Gmail you signed up with)
  *   BREVO_KEY_2                Brevo API key for account #2 (optional, +295 emails/day)
@@ -56,7 +60,7 @@ const storage = admin.storage();
 
 // ── Environment config (replaces functions.config()) ─────────────────────
 const env = {
-  gemini:   { key:           process.env.GEMINI_KEY },
+  gemini:   { key: process.env.GEMINI_KEY_1 || process.env.GEMINI_KEY }, // legacy GEMINI_KEY still works
   gmail:    { user: null, pass: null }, // kept for legacy reference only — email now uses SendGrid
   telegram: { token:         process.env.TELEGRAM_TOKEN,
               admin_chat_id: process.env.TELEGRAM_ADMIN_CHAT_ID },
@@ -65,6 +69,84 @@ const env = {
               secret:        process.env.ADMIN_SECRET },
   paystack: { secret:        process.env.PAYSTACK_SECRET }
 };
+
+// ── Gemini key pool — rotates across up to 4 keys (mirrors Brevo strategy) ────────
+// Each key is a free Google AI Studio key (1500 req/day).
+// 4 keys = up to 6000 Gemini calls/day across all features.
+// Set GEMINI_KEY_1 through GEMINI_KEY_4 in Railway → Variables.
+// GEMINI_KEY (no suffix) is also accepted as a legacy alias for key #1.
+const _geminiKeys = [];
+for (let _gi = 1; _gi <= 4; _gi++) {
+  const _k = process.env[`GEMINI_KEY_${_gi}`] || (_gi === 1 ? process.env.GEMINI_KEY : null);
+  if (_k && _k.trim()) _geminiKeys.push({ key: _k.trim(), callsToday: 0, lastResetDate: '' });
+}
+if (_geminiKeys.length > 0) {
+  console.log(`[CEE] Gemini: ${_geminiKeys.length} key(s) loaded — up to ${_geminiKeys.length * 1500} req/day`);
+} else {
+  console.warn('[CEE] Gemini: No keys configured. Add GEMINI_KEY_1 in Railway → Variables (free at aistudio.google.com).');
+}
+
+let _geminiRoundRobinIdx = 0;
+
+function _resetGeminiKeyIfNewDay(k) {
+  const today = nowWAT().toISODate();
+  if (k.lastResetDate !== today) {
+    k.exhausted = false;    // new day — quota resets regardless of what it was
+    k.callsToday = 0;
+    k.lastResetDate = today;
+  }
+}
+
+// Pick next available key using round-robin — skips keys marked exhausted today
+// No hardcoded quota limit: exhausted flag is ONLY set when the API returns 429.
+function _pickGeminiKey() {
+  if (!_geminiKeys.length) return null;
+  for (let attempt = 0; attempt < _geminiKeys.length; attempt++) {
+    const idx = (_geminiRoundRobinIdx + attempt) % _geminiKeys.length;
+    const k = _geminiKeys[idx];
+    _resetGeminiKeyIfNewDay(k);
+    if (!k.exhausted) {
+      _geminiRoundRobinIdx = (idx + 1) % _geminiKeys.length;
+      return k;
+    }
+  }
+  return null; // all keys hit 429 today
+}
+
+function _geminiUrl(k) {
+  return `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${k.key}`;
+}
+
+// Wrapper: pick key, call Gemini, rotate on 429, retry with next key automatically
+async function _geminiPost(bodyObj) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < Math.max(_geminiKeys.length, 1); attempt++) {
+    const k = _pickGeminiKey();
+    if (!k) return { ok: false, error: 'All Gemini keys hit their quota for today. Add more via GEMINI_KEY_2/3/4 in Railway.' };
+    try {
+      const r = await fetch(_geminiUrl(k), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(bodyObj)
+      });
+      k.callsToday++;
+      if (r.status === 429) {
+        k.exhausted = true; // quota hit — let the API decide, not us
+        lastErr = 'quota_exceeded';
+        console.warn(`[CEE] Gemini key #${_geminiKeys.indexOf(k)+1} exhausted (429) after ${k.callsToday} calls today — rotating`);
+        continue;
+      }
+      const data = await r.json();
+      return { ok: true, data };
+    } catch(e) {
+      lastErr = e.message;
+      console.error(`[CEE] Gemini call error (attempt ${attempt+1}):`, e.message);
+    }
+  }
+  return { ok: false, error: lastErr || 'Gemini call failed' };
+}
+
+// ── Gemini key pool ──────────────────────────────────────────────────────────
 
 // ── VAPID / Web Push ──────────────────────────────────────────────────────
 const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || '';
@@ -213,8 +295,9 @@ _initVapid();
 
 // ── Startup config validation ─────────────────────────────────────────────
 (function _validateConfig() {
-  const required = ['GEMINI_KEY','TELEGRAM_TOKEN',
-                    'TELEGRAM_ADMIN_CHAT_ID','ADMIN_EMAIL','ADMIN_SECRET'];
+  const required = ['TELEGRAM_TOKEN','TELEGRAM_ADMIN_CHAT_ID','ADMIN_EMAIL','ADMIN_SECRET'];
+  // Gemini keys are validated via the pool — at least one of GEMINI_KEY_1..4 must exist
+  if (!_geminiKeys.length) console.error('[CEE] FATAL: No Gemini keys found. Set GEMINI_KEY_1 in Railway → Variables (free at aistudio.google.com).');
   const missing = required.filter(k => !process.env[k]);
   if (missing.length > 0) {
     console.error(`[CEE] FATAL: Missing env vars: ${missing.join(', ')}`);
@@ -283,7 +366,7 @@ const _brevoAccounts = [];
 for (let i = 1; i <= 4; i++) {
   const key  = process.env[`BREVO_KEY_${i}`];
   const from = process.env[`BREVO_FROM_${i}`];
-  const name = process.env[`BREVO_NAME_${i}`] || process.env.BREVO_NAME_1 || 'CEE League';
+  const name = process.env[`BREVO_NAME_${i}`] || 'CEE League';
   if (key && from) {
     _brevoAccounts.push({ key, from, name, sentToday: 0, lastResetDate: '' });
   }
@@ -729,28 +812,6 @@ async function _sendMatchNotifications(type, fixtureId, playerAId, playerBId, se
       `🔄 <b>Replay scheduled</b>\nCheck the CEE Player Hub for your new match window.`
     );
   }
-  if (type === 'STATS_MISMATCH_REUPLOAD') {
-    await both(
-      'CEE — Stats Mismatch: Reupload Required ⚠️',
-      `<p>⚠️ <strong>Stats mismatch detected between your screenshots!</strong></p>
-       <p>The stat numbers on your two submissions do not match. This means at least one screenshot does not reflect the real match result.</p>
-       <div class="hl">⏰ Both players must reupload the correct Full Time stats board within <strong>6 minutes</strong>.<br>If either player misses this window, <strong>both players are automatically forfeited</strong> — no admin review, no exceptions.</div>
-       <p style="color:#BBBBC8;font-size:13px">This reupload is for re-verification only. Deliberately submitting a screenshot with different numbers is a serious violation and will result in disqualification.</p>`,
-      `⚠️ <b>STATS MISMATCH — REUPLOAD REQUIRED!</b>\n\nThe stats numbers on both screenshots do not match.\n\nBoth players must reupload the correct Full Time stats board within <b>6 minutes</b>.\n\n❌ If either player misses this window, BOTH players are automatically forfeited — no admin review.\n\n🌐 ${process.env.SITE_URL || 'https://cee-esports.web.app'}#hub`
-    );
-  }
-  if (type === 'DOUBLE_FORFEIT') {
-    await both(
-      'CEE — Double Forfeit Applied ⚫',
-      `<p>⚫ <strong>Double forfeit applied to your fixture.</strong></p>
-       <p>The 6-minute stats mismatch reupload window expired without both players submitting matching screenshots. Neither player receives points for this fixture.</p>
-       <div class="hl">Result: 0 – 0 · Double Forfeit — no points awarded to either player</div>`,
-      `⚫ <b>Double forfeit applied.</b>\n\nThe stats mismatch reupload window expired. Both players receive 0 points.\n\nResult: 0 – 0 (Double Forfeit)`
-    );
-    if (adminChat) sendTelegram(adminChat,
-      `⚫ <b>Double forfeit applied</b>\nFixture: ${fixtureId}\nStats mismatch — reupload deadline expired.`
-    ).catch(()=>{});
-  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -790,87 +851,6 @@ async function _crossValidateScores(fixtureId, fix) {
     await fixRef.update({ collusionFlagGD: true });
     await audit('ANTICHEAT_FLAG', fixtureId, 'fixture', `GD ≥ 6: ${hA}-${aA}`);
   }
-
-  // ── NEW: Cross-screenshot stats comparison ─────────────────────────────────
-  // Both players uploaded screenshots of the SAME match. The stats table must be
-  // identical in both. If they differ, one screenshot is fraudulent.
-  const statsA = fix.aiStatsA || {};
-  const statsB = fix.aiStatsB || {};
-  const statFields = ['shotsOnTargetHome','shotsOnTargetAway','foulsHome','foulsAway',
-                      'tacklesHome','tacklesAway','offsidesHome','offsidesAway'];
-  const statMismatches = [];
-  for (const field of statFields) {
-    const vA = statsA[field], vB = statsB[field];
-    if (vA !== null && vA !== undefined && vB !== null && vB !== undefined && vA !== vB) {
-      statMismatches.push(`${field}: A=${vA} vs B=${vB}`);
-    }
-  }
-  if (statMismatches.length > 0) {
-    const detail = statMismatches.join(', ');
-    const attempt = (fix.statsMismatchAttempt || 0) + 1;
-    await audit('ANTICHEAT_STATS_MISMATCH', fixtureId, 'fixture',
-      `Screenshot stats differ (attempt ${attempt}): ${detail}`);
-
-    if (attempt >= 2) {
-      // Stats STILL don't match after the reupload — both players forfeit immediately, no review
-      await fixRef.update({
-        status: 'approved', result: 'DOUBLE_FORFEIT',
-        isForfeit: true, playerAGoals: 0, playerBGoals: 0,
-        adminApproved: true, done: true,
-        statsMismatchFlag: true, statsMismatchDetail: detail,
-        statsMismatchAttempt: attempt,
-        statsMismatchReuploadWindow: false,
-        doubleForfeitReason: 'Stats mismatch persisted after reupload — both players forfeited',
-        autoApprovedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-      await _sendMatchNotifications('DOUBLE_FORFEIT', fixtureId, fix.playerAId, fix.playerBId, fix.seasonId);
-      const adminChatDF = env.telegram && env.telegram.admin_chat_id;
-      if (adminChatDF) sendTelegram(adminChatDF,
-        `🚫 <b>Double forfeit — stats still mismatched after reupload</b>\nFixture: ${fixtureId}\nMismatches: ${detail}`
-      ).catch(()=>{});
-      return;
-    }
-
-    // First mismatch — open a 6-minute reupload window for both players.
-    // Both submissions are cleared so each player can resubmit.
-    // NOTE: requires Firestore composite index: status + statsMismatchReuploadWindow + statsMismatchReuploadDeadline
-    const reuploadDeadline = toTS(nowWAT().plus({ minutes: 6 }));
-    await fixRef.update({
-      // ── Clear both submissions so players can reupload ──
-      playerASubmittedAt:   admin.firestore.FieldValue.delete(),
-      playerBSubmittedAt:   admin.firestore.FieldValue.delete(),
-      playerAScoreSealed:   admin.firestore.FieldValue.delete(),
-      playerBScoreSealed:   admin.firestore.FieldValue.delete(),
-      aiExtractedA:         admin.firestore.FieldValue.delete(),
-      aiExtractedB:         admin.firestore.FieldValue.delete(),
-      aiStatsA:             admin.firestore.FieldValue.delete(),
-      aiStatsB:             admin.firestore.FieldValue.delete(),
-      playerAScreenshotUrl: admin.firestore.FieldValue.delete(),
-      playerBScreenshotUrl: admin.firestore.FieldValue.delete(),
-      imageHashA:           admin.firestore.FieldValue.delete(),
-      imageHashB:           admin.firestore.FieldValue.delete(),
-      aiConfidenceA:        admin.firestore.FieldValue.delete(),
-      aiConfidenceB:        admin.firestore.FieldValue.delete(),
-      screenshotFlaggedForReview: admin.firestore.FieldValue.delete(),
-      screenshotFlagReason: admin.firestore.FieldValue.delete(),
-      opponentUploadDeadline: admin.firestore.FieldValue.delete(), // clear 15-min deadline
-      // ── Stats mismatch reupload window ──
-      statsMismatchFlag:             true,
-      statsMismatchDetail:           detail,
-      statsMismatchReuploadWindow:   true,
-      statsMismatchRejectedAt:       admin.firestore.FieldValue.serverTimestamp(),
-      statsMismatchReuploadDeadline: reuploadDeadline,
-      statsMismatchAttempt:          attempt,
-      status:                        'in_progress'
-    });
-    await _sendMatchNotifications('STATS_MISMATCH_REUPLOAD', fixtureId, fix.playerAId, fix.playerBId, fix.seasonId);
-    const adminChatMM = env.telegram && env.telegram.admin_chat_id;
-    if (adminChatMM) sendTelegram(adminChatMM,
-      `⚠️ <b>Stats mismatch — 6-min reupload window opened</b>\nFixture: ${fixtureId}\nMismatches: ${detail}\nBoth players notified to reupload.`
-    ).catch(()=>{});
-    return; // Do not continue to score-match / dispute logic
-  }
-  // ── END stats comparison ───────────────────────────────────────────────────
 
   const [prevA, prevB] = await Promise.all([
     db.collection('fixtures').where('seasonId','==',fix.seasonId).where('status','==','approved')
@@ -924,14 +904,7 @@ async function _crossValidateScores(fixtureId, fix) {
   }
 
   const autoApproveAt = toTS(nowWAT().plus({ minutes: 45 }));
-  await fixRef.update({
-    status:'pending_approval', autoApproveAt, playerAGoals: hA, playerBGoals: aA, adminApproved: false,
-    // Clear reupload window state now that scores are confirmed matching
-    ...(fix.statsMismatchReuploadWindow ? {
-      statsMismatchReuploadWindow: false,
-      statsMismatchReuploadDeadline: admin.firestore.FieldValue.delete()
-    } : {})
-  });
+  await fixRef.update({ status:'pending_approval', autoApproveAt, playerAGoals: hA, playerBGoals: aA, adminApproved: false });
   await _sendMatchNotifications('RESULT_PENDING', fixtureId, fix.playerAId, fix.playerBId, fix.seasonId);
 }
 
@@ -1072,7 +1045,143 @@ async function _recalcStandingsInternal(seasonId) {
   batch.update(db.collection('seasons').doc(seasonId), { standingsDirty: false });
   await batch.commit();
   console.log(`[CEE] Standings recalculated: ${sorted.length} players`);
+
+  // ── Tier Classification — runs after every standings recalculation ───────
+  // Players need 4+ verified matches to qualify for a tier assignment.
+  // PR (Performance Rating) is a weighted score across 6 dimensions.
+  // Tiers are relative (top 20% = Elite, middle 60% = Mid, bottom 20% = Underdog)
+  // so they self-calibrate as the season grows.
+  try {
+    await _recalculatePlayerTiers(seasonId, sorted);
+  } catch(tierErr) { console.error('[CEE] Tier classification error:', tierErr.message); }
+
+  // Background: refresh cached match probabilities after tiers update
+  db.collection('config').doc('matchProbabilities').get()
+    .then(d => {
+      // Invalidate cache so next /getMatchProbabilities call recalculates fresh
+      if (d.exists) return d.ref.update({ stale: true });
+    }).catch(() => {});
+
   return sorted;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TIER CLASSIFICATION ENGINE — Performance Rating + Tier Assignment
+// Runs after every standings recalculation. Requires 4+ verified matches.
+// PR Formula (0–100 scale):
+//   Win Rate          35% weight  — most important: winning is everything
+//   GD per match      20% weight  — margin of victories and defeats
+//   Shot accuracy     15% weight  — attacking efficiency
+//   Pass accuracy     15% weight  — build-up quality
+//   Goals scored/m   10% weight  — raw attacking output
+//   Defensive record   5% weight  — clean sheets / goals conceded
+// ═══════════════════════════════════════════════════════════════════════════
+async function _recalculatePlayerTiers(seasonId, sortedStandings) {
+  // Fetch matchStats for all players in this season
+  const allMatchSnap = await db.collection('matchStats')
+    .where('seasonId', '==', seasonId)
+    .get();
+
+  // Group by playerId
+  const playerMatchMap = {};
+  allMatchSnap.forEach(doc => {
+    const d = doc.data();
+    if (!playerMatchMap[d.playerId]) playerMatchMap[d.playerId] = [];
+    playerMatchMap[d.playerId].push(d);
+  });
+
+  // Calculate PR for each player with 4+ matches
+  const prScores = []; // { playerId, pr, matchCount }
+
+  for (const standing of sortedStandings) {
+    const pid = standing.id;
+    const matches = playerMatchMap[pid] || [];
+    if (matches.length < 4) continue; // Not enough data
+
+    const n = matches.length;
+    const wins   = matches.filter(m => m.result === 'W').length;
+    const losses = matches.filter(m => m.result === 'L').length;
+
+    // Win rate (0–100)
+    const winRate = (wins / n) * 100;
+
+    // GD per match — normalise to 0–100 (cap at +5 GD/m = 100, -5 GD/m = 0)
+    const totalGD = matches.reduce((acc, m) => acc + ((m.goalsFor || 0) - (m.goalsAgainst || 0)), 0);
+    const gdPerMatch = totalGD / n;
+    const gdScore = Math.max(0, Math.min(100, (gdPerMatch + 5) * 10)); // -5→0, 0→50, +5→100
+
+    // Shot accuracy (shotsOnTarget / shots * 100), avg across matches with data
+    const shotAccVals = matches
+      .map(m => m.stats && m.stats.shots > 0 && m.stats.shotsOnTarget != null
+        ? (m.stats.shotsOnTarget / m.stats.shots) * 100 : null)
+      .filter(v => v !== null);
+    const shotAcc = shotAccVals.length ? shotAccVals.reduce((a,b) => a+b, 0) / shotAccVals.length : 50;
+
+    // Pass accuracy avg
+    const passAccVals = matches
+      .map(m => m.stats && m.stats.passes > 0 && m.stats.successfulPasses != null
+        ? (m.stats.successfulPasses / m.stats.passes) * 100 : null)
+      .filter(v => v !== null);
+    const passAcc = passAccVals.length ? passAccVals.reduce((a,b) => a+b, 0) / passAccVals.length : 65;
+
+    // Goals scored per match (cap at 5 = 100)
+    const goalsPerMatch = matches.reduce((acc, m) => acc + (m.goalsFor || 0), 0) / n;
+    const goalsScore = Math.min(100, (goalsPerMatch / 5) * 100);
+
+    // Defensive record — invert goals conceded per match (0 conceded = 100, 5+ = 0)
+    const concededPerMatch = matches.reduce((acc, m) => acc + (m.goalsAgainst || 0), 0) / n;
+    const defScore = Math.max(0, Math.min(100, (1 - concededPerMatch / 5) * 100));
+
+    // Weighted PR
+    const pr = Math.round(
+      winRate      * 0.35 +
+      gdScore      * 0.20 +
+      shotAcc      * 0.15 +
+      passAcc      * 0.15 +
+      goalsScore   * 0.10 +
+      defScore     * 0.05
+    );
+
+    prScores.push({ playerId: pid, pr, matchCount: n, winRate: Math.round(winRate), gdPerMatch: Math.round(gdPerMatch * 10) / 10 });
+  }
+
+  if (prScores.length === 0) {
+    console.log('[CEE] Tier classification: no players with 4+ matches yet');
+    return;
+  }
+
+  // Assign tiers based on relative rank within qualified players
+  prScores.sort((a, b) => b.pr - a.pr);
+  const total = prScores.length;
+  const eliteCutoff = Math.ceil(total * 0.20);   // Top 20%
+  const midCutoff   = Math.ceil(total * 0.80);   // Top 80% (i.e. not bottom 20%)
+
+  const batch = db.batch();
+  prScores.forEach((p, idx) => {
+    let tier = 'mid';
+    if (idx < eliteCutoff)       tier = 'elite';
+    else if (idx >= midCutoff)   tier = 'underdog';
+
+    batch.update(db.collection('players').doc(p.playerId), {
+      performanceRating: p.pr,
+      playerTier: tier,
+      tierUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      tierMatchCount: p.matchCount
+    });
+  });
+
+  // Write tier summary to config for frontend to read
+  const tierSummary = {
+    seasonId,
+    totalRanked: total,
+    eliteThresholdPR: prScores[eliteCutoff - 1]?.pr || 0,
+    midThresholdPR:   prScores[midCutoff - 1]?.pr   || 0,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+  };
+  batch.set(db.collection('config').doc('tierSummary'), tierSummary);
+
+  await batch.commit();
+  console.log(`[CEE] Tiers assigned: ${prScores.filter((_,i) => i < eliteCutoff).length} Elite, ${prScores.filter((_,i) => i >= eliteCutoff && i < midCutoff).length} Mid, ${prScores.filter((_,i) => i >= midCutoff).length} Underdog (${total} total ranked)`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1764,7 +1873,7 @@ app.post('/declareUnavailable', async (req, res) => {
 // NOI-2: timing check BEFORE _crossValidateScores
 // ═══════════════════════════════════════════════════════════════════════════
 app.post('/submitScore', async (req, res) => {
-  const { fixtureId, playerId, isHome, imageData, mediaType } = req.body;
+  const { fixtureId, playerId, isHome, imageData, mediaType, matchContext } = req.body;
   if (!fixtureId||!playerId||!imageData) return res.status(400).json({ success:false, message:'Missing fields' });
   try {
     const fixRef=db.collection('fixtures').doc(fixtureId);
@@ -1778,20 +1887,7 @@ app.post('/submitScore', async (req, res) => {
     if (fix.windowOpenTime&&nowJsDate<fix.windowOpenTime.toDate())
       return res.json({ success:false, message:'Match window has not opened yet.' });
     const alreadyKey=isHome?'playerASubmittedAt':'playerBSubmittedAt';
-
-    // Block submission if the stats-mismatch reupload window has already expired
-    if (fix.statsMismatchReuploadWindow && fix.statsMismatchReuploadDeadline) {
-      if (nowJsDate > fix.statsMismatchReuploadDeadline.toDate()) {
-        return res.json({
-          success:false, verdict:'reupload_expired',
-          message:'⏰ The 6-minute reupload window has expired. Both players have been automatically forfeited due to the stats mismatch.'
-        });
-      }
-    }
-    // Block duplicate submission unless we are inside a stats-mismatch reupload window
-    // (in which case playerASubmittedAt/playerBSubmittedAt were deleted so fix[alreadyKey] is null anyway)
-    if (fix[alreadyKey] && !fix.statsMismatchReuploadWindow)
-      return res.json({ success:false, message:'You have already submitted.' });
+    if (fix[alreadyKey]) return res.json({ success:false, message:'You have already submitted.' });
 
     const imgBuf=Buffer.from(imageData,'base64');
     const imgHash=crypto.createHash('sha256').update(imgBuf).digest('hex');
@@ -1803,211 +1899,115 @@ app.post('/submitScore', async (req, res) => {
       return res.json({ success:false, message:'Screenshot matches opponent submission — anti-cheat flag raised.' });
     }
 
-    // ── LOAD PLAYER IDENTIFIERS FOR GEMINI PROMPT INJECTION ──────────────────
-    let homePlayer={ clubName:'', gameName:'', initials:'' };
-    let awayPlayer={ clubName:'', gameName:'', initials:'' };
+    let ai={ isEfootballResultScreen:false,homeGoals:null,awayGoals:null,confidence:0,homeClubName:null,awayClubName:null,isPlausibleScore:false,isFullResultScreen:false,
+             possessionHome:null,possessionAway:null,shotsHome:null,shotsAway:null,shotsOnTargetHome:null,shotsOnTargetAway:null,
+             foulsHome:null,foulsAway:null,offsidesHome:null,offsidesAway:null,cornerKicksHome:null,cornerKicksAway:null,
+             freeKicksHome:null,freeKicksAway:null,passesHome:null,passesAway:null,successfulPassesHome:null,successfulPassesAway:null,
+             crossesHome:null,crossesAway:null,interceptionsHome:null,interceptionsAway:null,tacklesHome:null,tacklesAway:null,savesHome:null,savesAway:null };
     try {
-      const [pASnap, pBSnap] = await Promise.all([
-        fix.playerAId ? db.collection('players').doc(fix.playerAId).get() : Promise.resolve(null),
-        fix.playerBId ? db.collection('players').doc(fix.playerBId).get() : Promise.resolve(null)
-      ]);
-      if (pASnap && pASnap.exists) {
-        const d = pASnap.data();
-        homePlayer = { clubName: d.clubName||'', gameName: d.gameName||'', initials: d.initials||'' };
-      }
-      if (pBSnap && pBSnap.exists) {
-        const d = pBSnap.data();
-        awayPlayer = { clubName: d.clubName||'', gameName: d.gameName||'', initials: d.initials||'' };
-      }
-    } catch(idErr){ console.error('[CEE] Player identifier load:',idErr.message); }
-
-    // ── GEMINI STATS BOARD ANALYSIS (Blueprint v1.0) ──────────────────────────
-    let ai={
-      isEfootballStatsBoard:false, screenType:'unknown',
-      timelineLabel:null, timelineAccepted:false,
-      homeTeamName:null, awayTeamName:null, homeNameMatch:'no', awayNameMatch:'no',
-      homeGoals:null, awayGoals:null,
-      shotsOnTargetHome:null, shotsOnTargetAway:null,
-      foulsHome:null, foulsAway:null,
-      tacklesHome:null, tacklesAway:null,
-      offsidesHome:null, offsidesAway:null,
-      suspiciousScoreToShots:false, extremeScore:false, homeAwaySwap:false,
-      matchSummary:null, homeAnalysis:null, awayAnalysis:null, keyStatInsight:null,
-      confidence:0, rejectionReason:null
-    };
-    try {
-      const geminiUrl=`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.gemini.key}`;
-      const geminiPrompt=`You are the CEE (Campus eSports Elite) AI Match Verifier.
-CEE is a competitive eFootball (Konami soccer video game) campus tournament platform.
-Your task is to analyse the submitted screenshot and extract structured match data.
-
-// ─── FIXTURE CONTEXT (injected from Firestore) ─────────────────────────────
-Home Player: Club="${homePlayer.clubName}" | GameTag="${homePlayer.gameName}" | Initials="${homePlayer.initials}"
-Away Player: Club="${awayPlayer.clubName}" | GameTag="${awayPlayer.gameName}" | Initials="${awayPlayer.initials}"
-
-// ─── WHAT A VALID EFOOTBALL STATS BOARD LOOKS LIKE ────────────────────────
-A VALID eFootball stats board has ALL of these elements:
-  1. SCORE BANNER: Dark navy blue (#1a1a6e) horizontal band across the top half of screen. Home team name in large bold yellow text on the LEFT side. Away team name in large bold yellow text on the RIGHT side. Two solid yellow square boxes showing integer goal scores, flanking the eFootball logo (three horizontal lines of different widths — a stylised letter E).
-  2. TIMELINE BAR: A solid yellow/gold (#e6c22a) rectangular bar directly below the score banner. Dark navy text centred inside it. Possible values: "Full Time", "Full Time (AET)", "Penalty Shootout", "Half Time", "Interval". The ONLY acceptable values for CEE are: "Full Time", "Full Time (AET)", "Penalty Shootout".
-  3. STATS TABLE: Dark navy background, 3-column layout in the centre-middle of the screen: [Home value] | [Stat label] | [Away value]. Rows always in this order: Possession (%), Shots, Shots on Target, Fouls, Offsides, Corner Kicks, Free Kicks, Passes, Successful Passes, Crosses, Interceptions, Tackles, Saves.
-  4. SIDE AREAS: Yellow/gold background on both sides of the stats table. Diagonal navy chevron/arrow stripe pattern. Team crest badge image in the centre of each side area.
-  5. NAVIGATION: A cyan/blue rounded-rectangle button at the screen bottom. "Next ›" at bottom-RIGHT = Full Time or later phase. "‹ Back" at bottom-LEFT = Half Time.
-
-// ─── SCREENS TO REJECT IMMEDIATELY ───────────────────────────────────────
-REJECT instantly (isEfootballStatsBoard=false) if the image is:
-  - Pause menu (shows: Game Plan, Command List, Camera, Audio, Quit Match options)
-  - Pre-match lobby or team selection screen
-  - In-game HUD (score shown as overlay during match, players actively moving)
-  - Photo of a phone screen (meta-screenshot with visible phone edges)
-  - Social media post, video thumbnail, or any non-gameplay screen
-  - Any image lacking the navy/yellow stats board colour scheme and structure above
-
-// ─── EXTRACTION INSTRUCTIONS ──────────────────────────────────────────────
-If this IS a valid stats board:
-
-  STEP 1 — Read Timeline Label from yellow bar. Extract exact text.
-  If "Half Time": timelineAccepted=false, rejectionReason="Half Time screenshot detected. Your match is still in progress — only 45 minutes have been played. Play the full 90 minutes, then submit the Full Time stats board that appears at the end."
-  If "Interval": timelineAccepted=false, rejectionReason="Extra time interval screenshot detected. Your match has a second half of extra time still to play. Submit the Full Time (AET) screenshot after extra time finishes."
-  If "Full Time (AET)" or "Penalty Shootout": timelineAccepted=true (but flag for admin review).
-  If "Full Time": timelineAccepted=true.
-
-  STEP 2 — Read Score from the two yellow boxes. Left box = homeGoals, Right = awayGoals.
-
-  STEP 3 — Read Team Names from the score banner.
-  homeTeamName = text on LEFT of score banner.
-  awayTeamName = text on RIGHT of score banner.
-  homeNameMatch = fuzzy compare homeTeamName vs all 3 home player identifiers → "yes"/"partial"/"no"
-  awayNameMatch = fuzzy compare awayTeamName vs all 3 away player identifiers → "yes"/"partial"/"no"
-  "yes" = 80%+ similarity. "partial" = 50-79% similarity. "no" = below 50%.
-
-  STEP 4 — Read Key Stats from table:
-  shotsOnTargetHome, shotsOnTargetAway, foulsHome, foulsAway, tacklesHome, tacklesAway, offsidesHome, offsidesAway
-
-  STEP 5 — Anti-cheat flags (set to true if triggered):
-  suspiciousScoreToShots: homeGoals >= 5 AND shotsOnTargetHome <= 1, OR awayGoals >= 5 AND shotsOnTargetAway <= 1
-  extremeScore: abs(homeGoals - awayGoals) >= 10 OR homeGoals > 15 OR awayGoals > 15
-  homeAwaySwap: homeTeamName matches AWAY player identifiers AND awayTeamName matches HOME player identifiers
-
-  STEP 6 — Match Analysis (only if isEfootballStatsBoard=true AND timelineAccepted=true):
-  matchSummary: 2–3 sentence narrative of how the match played out based on the full stats.
-  homeAnalysis: { strengths: [2–3 items], improvements: [2–3 items] }
-  awayAnalysis: { strengths: [2–3 items], improvements: [2–3 items] }
-  keyStatInsight: 1 sentence highlighting the single most interesting statistical contrast.
-
-// ─── OUTPUT INSTRUCTION ───────────────────────────────────────────────────
-Respond ONLY with a valid JSON object. No markdown. No code fences. No explanation.
-No preamble. No trailing text. Just the raw JSON starting with { and ending with }.
-
-Required fields:
-{
-  "isEfootballStatsBoard": true/false,
-  "screenType": "string description",
-  "timelineLabel": "exact text from yellow bar or null",
-  "timelineAccepted": true/false,
-  "homeTeamName": "string or null",
-  "awayTeamName": "string or null",
-  "homeNameMatch": "yes"/"partial"/"no",
-  "awayNameMatch": "yes"/"partial"/"no",
-  "homeGoals": integer or null,
-  "awayGoals": integer or null,
-  "shotsOnTargetHome": integer or null,
-  "shotsOnTargetAway": integer or null,
-  "foulsHome": integer or null,
-  "foulsAway": integer or null,
-  "tacklesHome": integer or null,
-  "tacklesAway": integer or null,
-  "offsidesHome": integer or null,
-  "offsidesAway": integer or null,
-  "suspiciousScoreToShots": false,
-  "extremeScore": false,
-  "homeAwaySwap": false,
-  "matchSummary": "string or null",
-  "homeAnalysis": { "strengths": [], "improvements": [] } or null,
-  "awayAnalysis": { "strengths": [], "improvements": [] } or null,
-  "keyStatInsight": "string or null",
-  "confidence": 0.0-1.0,
-  "rejectionReason": "string or null"
-}`;
-      const cr=await fetch(geminiUrl,{
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({
+      const _gRes=await _geminiPost({
           contents:[{parts:[
             {inline_data:{mime_type:mediaType||'image/jpeg',data:imageData}},
-            {text:geminiPrompt}
+            {text:`You are the CEE Anti-Cheat Vision System — a fraud detection and stat extraction engine for the Campus eSports Elite eFootball tournament.\n\nYour job has TWO parts:\n\nPART 1 — FRAUD DETECTION (reason independently):\nExamine this screenshot and identify anything suspicious or inconsistent. Do NOT rely on rules given to you — reason from what you actually see in the image. Look for:\n- Signs of image editing: inconsistent fonts, pixel artifacts, blurry number regions, mismatched background textures, sharp edges around numbers suggesting overlay\n- Statistical impossibilities: e.g. more shots on target than total shots, possession values not summing to ~100, saves > shots on target, successful passes > total passes\n- Score/stat coherence: can the goals scored be explained by the shots on target and saves shown?\n- UI authenticity: does the screen look like a genuine eFootball post-match stats board? Check layout, colors, fonts, positioning of all elements\n- Scoreline plausibility: is the goal difference extreme? Are stats consistent with a high-scoring match?\n\nPART 2 — STAT EXTRACTION:\nExtract every number from the stats table precisely.\n\nRespond ONLY in JSON, no other text, no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<string or null>",\n  "awayClubName": "<string or null>",\n  "isPlausibleScore": true/false,\n  "confidence": <float 0.0-1.0>,\n  "fraudSuspicion": <float 0.0-1.0>,\n  "fraudIndicators": [<array of strings — each a specific suspicious observation, empty array if none>],\n  "statisticalAnomalies": [<array of strings — each a stat that is mathematically inconsistent, empty if none>],\n  "uiAuthenticityScore": <float 0.0-1.0>,\n  "possessionHome": <integer 0-100 or null>,\n  "possessionAway": <integer 0-100 or null>,\n  "shotsHome": <integer or null>,\n  "shotsAway": <integer or null>,\n  "shotsOnTargetHome": <integer or null>,\n  "shotsOnTargetAway": <integer or null>,\n  "foulsHome": <integer or null>,\n  "foulsAway": <integer or null>,\n  "offsidesHome": <integer or null>,\n  "offsidesAway": <integer or null>,\n  "cornerKicksHome": <integer or null>,\n  "cornerKicksAway": <integer or null>,\n  "freeKicksHome": <integer or null>,\n  "freeKicksAway": <integer or null>,\n  "passesHome": <integer or null>,\n  "passesAway": <integer or null>,\n  "successfulPassesHome": <integer or null>,\n  "successfulPassesAway": <integer or null>,\n  "crossesHome": <integer or null>,\n  "crossesAway": <integer or null>,\n  "interceptionsHome": <integer or null>,\n  "interceptionsAway": <integer or null>,\n  "tacklesHome": <integer or null>,\n  "tacklesAway": <integer or null>,\n  "savesHome": <integer or null>,\n  "savesAway": <integer or null>\n}\nField rules:\n- fraudSuspicion: your overall confidence this screenshot has been tampered with. 0.0=definitely real, 1.0=definitely fraudulent. Be precise — do not default to 0.5.\n- fraudIndicators: list every specific visual or structural anomaly you detected. If none, empty array.\n- statisticalAnomalies: list any stat values that are mathematically impossible or highly improbable given the other stats.\n- uiAuthenticityScore: how closely the UI matches a genuine eFootball post-match stats board. 1.0=perfect match, 0.0=clearly not eFootball.\n- isPlausibleScore: false if goal difference >= 8 or either score > 15\n- confidence: your certainty that ALL stat values were read correctly. 1.0=certain, 0.0=unreadable.\n- possessionHome + possessionAway must sum to approximately 100\n- successfulPasses must be <= passes for each team\n- shotsOnTarget must be <= shots for each team\n- saves must be <= shotsOnTarget of the OPPOSING team\n- Set isEfootballResultScreen/isFullResultScreen to false and all stats to null if this is not a genuine eFootball stats board`}
           ]}],
-          generationConfig:{maxOutputTokens:2500,temperature:0,responseMimeType:'application/json'}
-        })
-      });
-      const cd=await cr.json();
-      if (cd.error) throw new Error(`Gemini API error: ${cd.error.message||JSON.stringify(cd.error)}`);
-      if (!cd.candidates||!cd.candidates[0]) {
-        const reason=cd.promptFeedback?JSON.stringify(cd.promptFeedback):'No candidates';
-        throw new Error(`Gemini returned no result: ${reason}`);
-      }
-      const cPart=cd.candidates[0];
-      if (!cPart.content||!cPart.content.parts||!cPart.content.parts[0]||!cPart.content.parts[0].text) {
-        throw new Error(`Gemini empty content. Finish reason: ${cPart.finishReason||'unknown'}`);
-      }
-      const rawText=cPart.content.parts[0].text;
-      const cleanedText=rawText.replace(/```json\s*/gi,'').replace(/```\s*/g,'').trim();
-      const jsonMatch=cleanedText.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) throw new Error('No JSON object in Gemini response');
-      ai=JSON.parse(jsonMatch[0]);
+          generationConfig:{maxOutputTokens:4000,temperature:0}
+        });
+      if (!_gRes.ok) throw new Error(_gRes.error || 'Gemini Vision call failed');
+      const raw=(_gRes.data.candidates&&_gRes.data.candidates[0]&&_gRes.data.candidates[0].content&&_gRes.data.candidates[0].content.parts&&_gRes.data.candidates[0].content.parts[0]&&_gRes.data.candidates[0].content.parts[0].text)||'{}';
+      ai=JSON.parse(raw.replace(/```json|```/g,'').trim());
     } catch(aiErr){ console.error('[CEE] Gemini Vision error:',aiErr.message); }
 
-    // ── GATE C1: Not a stats board at all ─────────────────────────────────────
-    if (!ai.isEfootballStatsBoard) {
-      await audit('ANTICHEAT_INVALID_SCREENSHOT',fixtureId,'fixture',`Player ${playerId} submitted non-stats-board: ${ai.screenType||'unknown'}`);
-      const screenDesc = ai.screenType ? ` (detected: ${ai.screenType})` : '';
-      return res.json({ success:false, verdict:'rejected', screenType:ai.screenType||null, message:`Not a valid eFootball stats board${screenDesc}. Submit the Full Time stats board that appears after your match ends — not the pause menu, half-time screen, or any in-game screen.` });
+    if (!ai.isEfootballResultScreen||!ai.isFullResultScreen) {
+      await audit('ANTICHEAT_INVALID_SCREENSHOT',fixtureId,'fixture',`Player ${playerId} submitted non-eFootball screenshot`);
+      return res.json({ success:false, message:'Not a valid eFootball result screen. Upload the correct screenshot.' });
     }
-
-    // ── GATE C2: Wrong timeline ────────────────────────────────────────────────
-    if (!ai.timelineAccepted) {
-      await audit('ANTICHEAT_INVALID_SCREENSHOT',fixtureId,'fixture',`Player ${playerId} wrong timeline: ${ai.timelineLabel||'unknown'}`);
-      return res.json({ success:false, verdict:'rejected', timelineLabel:ai.timelineLabel, message: ai.rejectionReason || `Wrong timeline detected (${ai.timelineLabel||'unknown'}). Submit the Full Time stats board.` });
-    }
-
-    // ── C3–C6: Confidence scoring ──────────────────────────────────────────────
-    const conf=ai.confidence||0;
-    let flagged=false, flagReason='';
-    // Timeline accepted = Full Time (AET) or Penalty Shootout → flag for admin
-    const isExtraTime=(ai.timelineLabel==='Full Time (AET)'||ai.timelineLabel==='Penalty Shootout');
-    if (isExtraTime){ flagged=true; flagReason=`${ai.timelineLabel} result — admin confirmation required`; }
-
-    // Anti-cheat flags from Blueprint
-    if (ai.suspiciousScoreToShots){
-      flagged=true; flagReason=flagReason||'Suspicious score-to-shots ratio';
+    if (!ai.isPlausibleScore) {
       await fixRef.update({ collusionFlagGD:true });
-      await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Suspicious score/shots: ${ai.homeGoals}-${ai.awayGoals}`);
-    }
-    if (ai.extremeScore){
-      flagged=true; flagReason=flagReason||'Extreme score detected';
-      await fixRef.update({ collusionFlagGD:true });
-      await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Extreme score: ${ai.homeGoals}-${ai.awayGoals}`);
-    }
-    if (ai.homeAwaySwap){
-      flagged=true; flagReason=flagReason||'Home/away perspective swap detected';
-      await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Perspective swap: home=${ai.homeTeamName}, away=${ai.awayTeamName}`);
+      await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Implausible score: ${ai.homeGoals}-${ai.awayGoals}`);
     }
 
-    // Name matching logic (C4+C5)
-    const bothNamesNo = ai.homeNameMatch==='no' && ai.awayNameMatch==='no';
-    const oneNameNo   = (ai.homeNameMatch==='no' || ai.awayNameMatch==='no') && !bothNamesNo;
-    if (bothNamesNo){
-      await fixRef.update({ clubNameMismatchFlag:true, clubNameMismatchDetail:`Screen: ${ai.homeTeamName||'?'} vs ${ai.awayTeamName||'?'} | Registered: ${homePlayer.clubName||homePlayer.gameName} vs ${awayPlayer.clubName||awayPlayer.gameName}` });
-      await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Both names no-match: ${ai.homeTeamName}/${ai.awayTeamName}`);
-      return res.json({ success:false, verdict:'rejected', message:'Club names on screenshot do not match this fixture. Make sure you are submitting the correct match result.' });
-    }
-    if (oneNameNo){ flagged=true; flagReason=flagReason||'One team name could not be confirmed — admin review'; }
+    // AC-1: club name fuzzy match
+    try {
+      const fixData=(await fixRef.get()).data();
+      const pADoc=fixData.playerAId?await db.collection('players').doc(fixData.playerAId).get():null;
+      const pBDoc=fixData.playerBId?await db.collection('players').doc(fixData.playerBId).get():null;
+      const clubA=pADoc&&pADoc.exists?(pADoc.data().clubName||'').toLowerCase().trim():'';
+      const clubB=pBDoc&&pBDoc.exists?(pBDoc.data().clubName||'').toLowerCase().trim():'';
+      const ssHomeRaw=(ai.homeClubName||'').toLowerCase().trim();
+      const ssAwayRaw=(ai.awayClubName||'').toLowerCase().trim();
+      const onScreen=[ssHomeRaw,ssAwayRaw].filter(Boolean);
+      const registered=[clubA,clubB].filter(Boolean);
+      let bothMatch=false;
+      if (onScreen.length>=2&&registered.length>=2) {
+        const [ssH,ssA]=onScreen,[rA,rB]=registered;
+        bothMatch=(_stringSimilarity(ssH,rA)>=CLUB_MATCH_THRESHOLD&&_stringSimilarity(ssA,rB)>=CLUB_MATCH_THRESHOLD)||
+                  (_stringSimilarity(ssH,rB)>=CLUB_MATCH_THRESHOLD&&_stringSimilarity(ssA,rA)>=CLUB_MATCH_THRESHOLD);
+      }
+      if (onScreen.length>=2&&!bothMatch) {
+        await fixRef.update({ clubNameMismatchFlag:true, clubNameMismatchDetail:`Screen: ${ssHomeRaw} vs ${ssAwayRaw} | Registered: ${clubA} vs ${clubB}` });
+        await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Club name mismatch: ${ssHomeRaw}/${ssAwayRaw} vs ${clubA}/${clubB}`);
+        return res.json({ success:false, message:'Club names on screenshot do not match this fixture. Make sure you are submitting the correct match result.' });
+      }
+    } catch(clubErr){ console.error('[CEE] Club name check:',clubErr.message); }
 
-    // Confidence threshold
-    if (conf<0.60 && !flagged) {
-      const retryKey=isHome?'playerARetryCount':'playerBRetryCount';
-      const retries=fix[retryKey]||0;
-      if (retries>=1){ flagged=true; flagReason='Low AI confidence after retry — admin review required'; }
-      else { await fixRef.update({[retryKey]:retries+1}); return res.json({ success:false,retry:true,confidence:conf,verdict:'retry',message:`Stats board unclear (${Math.round(conf*100)}% confidence). Upload a clearer screenshot. 1 retry remaining.` }); }
-    } else if (conf<0.85 && !flagged){ flagged=true; flagReason=`AI confidence ${Math.round(conf*100)}% — below auto-accept threshold`; }
+    const conf = ai.confidence || 0;
+    const fraudSuspicion   = ai.fraudSuspicion   || 0;
+    const uiAuthScore      = ai.uiAuthenticityScore != null ? ai.uiAuthenticityScore : 1.0;
+    const fraudIndicators  = Array.isArray(ai.fraudIndicators)  ? ai.fraudIndicators  : [];
+    const statAnomalies    = Array.isArray(ai.statisticalAnomalies) ? ai.statisticalAnomalies : [];
+
+    let flagged = false, flagReason = '';
+
+    // ── AI Fraud Detection — act on what Gemini independently flagged ────────
+    if (fraudSuspicion >= 0.75) {
+      // High suspicion — block immediately, send to admin arbitration
+      const fraudDetail = [
+        `AI fraud suspicion: ${Math.round(fraudSuspicion*100)}%`,
+        `UI authenticity: ${Math.round(uiAuthScore*100)}%`,
+        fraudIndicators.length ? 'Indicators: ' + fraudIndicators.join(' | ') : '',
+        statAnomalies.length   ? 'Stat anomalies: ' + statAnomalies.join(' | ') : ''
+      ].filter(Boolean).join(' — ');
+      await fixRef.update({ screenshotFlaggedForReview: true, screenshotFlagReason: fraudDetail, status: 'admin_arbitration', fraudArbitrationAt: admin.firestore.FieldValue.serverTimestamp() });
+      await audit('ANTICHEAT_FRAUD_DETECTED', fixtureId, 'fixture', `High fraud suspicion from AI: ${fraudDetail}`);
+      const adminChat = env.telegram.admin_chat_id;
+      if (adminChat) await sendTelegram(adminChat, `🚨 <b>FRAUD ALERT</b>
+
+Fixture: <code>${fixtureId}</code>
+Player: <code>${playerId}</code>
+AI suspicion: <b>${Math.round(fraudSuspicion*100)}%</b>
+${fraudIndicators.length ? '🔍 ' + fraudIndicators.slice(0,3).join(' | ') : ''}
+
+<b>Action required — Admin Arbitration</b>`);
+      return res.json({ success: false, message: 'Screenshot failed authenticity check. This submission has been flagged for admin review.' });
+    } else if (fraudSuspicion >= 0.45) {
+      // Moderate suspicion — flag for review but allow submission
+      flagged = true;
+      flagReason = `AI fraud suspicion ${Math.round(fraudSuspicion*100)}% — ${fraudIndicators.slice(0,2).join('; ') || 'review recommended'}`;
+    }
+
+    // ── Stat anomaly flag (independent of fraud suspicion) ─────────────────
+    if (statAnomalies.length > 0 && !flagged) {
+      flagged = true;
+      flagReason = `Statistical anomalies detected: ${statAnomalies.slice(0,2).join('; ')}`;
+    }
+
+    // ── UI authenticity too low ─────────────────────────────────────────────
+    if (uiAuthScore < 0.50 && !flagged) {
+      flagged = true;
+      flagReason = `Low UI authenticity score (${Math.round(uiAuthScore*100)}%) — screenshot may not be genuine eFootball`;
+    }
+
+    // ── Standard confidence check ───────────────────────────────────────────
+    if (!flagged) {
+      if (conf < 0.60) {
+        const retryKey = isHome ? 'playerARetryCount' : 'playerBRetryCount';
+        const retries  = fix[retryKey] || 0;
+        if (retries >= 1) { flagged = true; flagReason = 'Low AI confidence after retry — admin review required'; }
+        else { await fixRef.update({ [retryKey]: retries+1 }); return res.json({ success:false, retry:true, confidence:conf, message:`Screenshot unclear (${Math.round(conf*100)}% confidence). Upload a clearer result screen. 1 retry remaining.` }); }
+      } else if (conf < 0.85) {
+        flagged = true; flagReason = `AI confidence ${Math.round(conf*100)}% — below auto-accept threshold`;
+      }
+    }
 
     const fname=`screenshots/${fixtureId}/${playerId}/${Date.now()}.jpg`;
     const bucket=storage.bucket(), file=bucket.file(fname);
@@ -2017,18 +2017,69 @@ Required fields:
     const scoreStr=(ai.homeGoals!==null&&ai.awayGoals!==null)?`${ai.homeGoals}-${ai.awayGoals}`:'unknown';
     const sealed=crypto.createHash('sha256').update(scoreStr+fixtureId).digest('hex');
     const nowFV=admin.firestore.FieldValue.serverTimestamp();
-    // Full stats snapshot for cross-comparison
-    const aiStats={ home:ai.homeGoals, away:ai.awayGoals,
-      shotsOnTargetHome:ai.shotsOnTargetHome, shotsOnTargetAway:ai.shotsOnTargetAway,
-      foulsHome:ai.foulsHome, foulsAway:ai.foulsAway,
-      tacklesHome:ai.tacklesHome, tacklesAway:ai.tacklesAway,
-      offsidesHome:ai.offsidesHome, offsidesAway:ai.offsidesAway,
-      timelineLabel:ai.timelineLabel, homeTeamName:ai.homeTeamName, awayTeamName:ai.awayTeamName };
+    // Build full 26-field stats object from Gemini extraction
+    const _aiStatsFull = {
+      possessionHome:ai.possessionHome??null, possessionAway:ai.possessionAway??null,
+      shotsHome:ai.shotsHome??null, shotsAway:ai.shotsAway??null,
+      shotsOnTargetHome:ai.shotsOnTargetHome??null, shotsOnTargetAway:ai.shotsOnTargetAway??null,
+      foulsHome:ai.foulsHome??null, foulsAway:ai.foulsAway??null,
+      offsidesHome:ai.offsidesHome??null, offsidesAway:ai.offsidesAway??null,
+      cornerKicksHome:ai.cornerKicksHome??null, cornerKicksAway:ai.cornerKicksAway??null,
+      freeKicksHome:ai.freeKicksHome??null, freeKicksAway:ai.freeKicksAway??null,
+      passesHome:ai.passesHome??null, passesAway:ai.passesAway??null,
+      successfulPassesHome:ai.successfulPassesHome??null, successfulPassesAway:ai.successfulPassesAway??null,
+      crossesHome:ai.crossesHome??null, crossesAway:ai.crossesAway??null,
+      interceptionsHome:ai.interceptionsHome??null, interceptionsAway:ai.interceptionsAway??null,
+      tacklesHome:ai.tacklesHome??null, tacklesAway:ai.tacklesAway??null,
+      savesHome:ai.savesHome??null, savesAway:ai.savesAway??null
+    };
     const update={};
-    if (isHome){ Object.assign(update,{playerAScoreSealed:sealed,playerAScreenshotUrl:ssUrl,playerASubmittedAt:nowFV,aiConfidenceA:conf,aiExtractedA:{home:ai.homeGoals,away:ai.awayGoals},aiStatsA:aiStats,imageHashA:imgHash}); }
-    else       { Object.assign(update,{playerBScoreSealed:sealed,playerBScreenshotUrl:ssUrl,playerBSubmittedAt:nowFV,aiConfidenceB:conf,aiExtractedB:{home:ai.homeGoals,away:ai.awayGoals},aiStatsB:aiStats,imageHashB:imgHash}); }
+    const _aiFraudData = { fraudSuspicion, uiAuthenticityScore: uiAuthScore, fraudIndicators, statisticalAnomalies: statAnomalies };
+    if (isHome){ Object.assign(update,{playerAScoreSealed:sealed,playerAScreenshotUrl:ssUrl,playerASubmittedAt:nowFV,aiConfidenceA:conf,aiExtractedA:{home:ai.homeGoals,away:ai.awayGoals},aiStatsA:_aiStatsFull,aiFraudA:_aiFraudData,imageHashA:imgHash}); }
+    else       { Object.assign(update,{playerBScoreSealed:sealed,playerBScreenshotUrl:ssUrl,playerBSubmittedAt:nowFV,aiConfidenceB:conf,aiExtractedB:{home:ai.homeGoals,away:ai.awayGoals},aiStatsB:_aiStatsFull,aiFraudB:_aiFraudData,imageHashB:imgHash}); }
     if (flagged){ update.screenshotFlaggedForReview=true; update.screenshotFlagReason=flagReason; }
     await fixRef.update(update);
+
+    // ── CEE INTELLIGENCE: Write matchStats document (non-blocking background write) ──
+    // Fires regardless of whether both players have submitted — we write on each submission
+    // so data collection starts from Match Day 1.
+    try {
+      const seasonId = fix.seasonId || await getSeasonId();
+      const matchStatDocId = `${fixtureId}_${playerId}`;
+      const myGoals   = isHome ? (ai.homeGoals??0) : (ai.awayGoals??0);
+      const oppGoals  = isHome ? (ai.awayGoals??0) : (ai.homeGoals??0);
+      const result    = myGoals > oppGoals ? 'W' : myGoals < oppGoals ? 'L' : 'D';
+      // Build per-player stats (from their own perspective: their team vs opponent)
+      const myStats = {
+        possession:       isHome ? (ai.possessionHome??null) : (ai.possessionAway??null),
+        shots:            isHome ? (ai.shotsHome??null)       : (ai.shotsAway??null),
+        shotsOnTarget:    isHome ? (ai.shotsOnTargetHome??null) : (ai.shotsOnTargetAway??null),
+        fouls:            isHome ? (ai.foulsHome??null)        : (ai.foulsAway??null),
+        offsides:         isHome ? (ai.offsidesHome??null)     : (ai.offsidesAway??null),
+        cornerKicks:      isHome ? (ai.cornerKicksHome??null)  : (ai.cornerKicksAway??null),
+        freeKicks:        isHome ? (ai.freeKicksHome??null)    : (ai.freeKicksAway??null),
+        passes:           isHome ? (ai.passesHome??null)       : (ai.passesAway??null),
+        successfulPasses: isHome ? (ai.successfulPassesHome??null) : (ai.successfulPassesAway??null),
+        crosses:          isHome ? (ai.crossesHome??null)      : (ai.crossesAway??null),
+        interceptions:    isHome ? (ai.interceptionsHome??null): (ai.interceptionsAway??null),
+        tackles:          isHome ? (ai.tacklesHome??null)      : (ai.tacklesAway??null),
+        saves:            isHome ? (ai.savesHome??null)        : (ai.savesAway??null)
+      };
+      const msWrite = {
+        fixtureId, playerId, seasonId,
+        opponentId: isHome ? fix.playerBId : fix.playerAId,
+        matchDay:   fix.matchday || null,
+        isHome:     !!isHome,
+        result,
+        goalsFor:    myGoals,
+        goalsAgainst: oppGoals,
+        verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+        stats:   myStats,
+        context: matchContext || null
+      };
+      db.collection('matchStats').doc(matchStatDocId).set(msWrite, { merge:true })
+        .catch(e => console.error('[CEE] matchStats write failed (non-blocking):', e.message));
+    } catch(msErr){ console.error('[CEE] matchStats prep error:', msErr.message); }
 
     const fresh=(await fixRef.get()).data();
     if (fresh.playerASubmittedAt&&fresh.playerBSubmittedAt) {
@@ -2039,49 +2090,74 @@ Required fields:
       if (diff<30) {
         await fixRef.update({ collusionFlagTime:true, collusionFlagTimeDetail:`Both screenshots within ${diff.toFixed(1)}s` });
         await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Suspicious: both screenshots within ${diff.toFixed(1)}s`);
-      } else if (diff>720) {
+      } else if (diff>450) {
         await fixRef.update({ lateSubmissionFlag:true, lateSubmissionDetail:`${Math.round(diff/60)} min gap` });
-        await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Suspicious: ${Math.round(diff/60)} min gap`);
+        await audit('ANTICHEAT_FLAG',fixtureId,'fixture',`Suspicious: ${Math.round(diff/60)} min gap — exceeded 7.5 min window`);
       }
-      await _crossValidateScores(fixtureId,fresh);
-    } else {
-      await logNotif(fixtureId,playerId,'telegram','SUBMISSION_RECEIVED','sent');
-      // ── Set 15-minute opponent upload deadline on the FIRST submission ──────
-      // Condition: the other player hasn't submitted yet, and this isn't a
-      // stats-mismatch reupload window (which has its own 6-min deadline), and
-      // we haven't already set an opponent deadline.
-      // NOTE: requires Firestore composite index: status + opponentUploadDeadline
-      const otherSubmitted = isHome ? fix.playerBSubmittedAt : fix.playerASubmittedAt;
-      const isFirstSub = !otherSubmitted
-        && !fix.statsMismatchReuploadWindow
-        && !fix.opponentUploadDeadline;
-      if (isFirstSub) {
-        const oppDeadline = toTS(nowWAT().plus({ minutes: 15 }));
-        await fixRef.update({ opponentUploadDeadline: oppDeadline });
-        const opponentId = isHome ? fix.playerBId : fix.playerAId;
-        await _notifyPlayer(opponentId, fixtureId, 'OPPONENT_SUBMITTED',
-          'CEE — Submit Your Result Now! ⏰',
-          `<p>⏰ <strong>Your opponent has submitted their result!</strong></p>
-           <p>You now have <strong>15 minutes</strong> to upload your Full Time stats board.
-           If you miss this window your opponent wins automatically — <strong>3-0 forfeit</strong>.</p>
-           <div class="hl">⚠️ Deadline: 15 minutes from now — act immediately!</div>`,
-          `⏰ <b>URGENT: Submit your result NOW!</b>\n\nYour opponent has submitted their screenshot. You have exactly <b>15 minutes</b> to upload yours, or you forfeit the match 3-0.\n\n🌐 ${process.env.SITE_URL || 'https://cee-esports.web.app'}#hub`
-        ).catch(()=>{});
-      }
-    }
 
-    const verdict = flagged ? 'needs_review' : 'approved';
-    return res.json({
-      success:true, verdict, confidence:conf, timelineLabel:ai.timelineLabel,
-      homeGoals:ai.homeGoals, awayGoals:ai.awayGoals,
-      homeNameMatch:ai.homeNameMatch, awayNameMatch:ai.awayNameMatch,
-      matchSummary:ai.matchSummary||null, homeAnalysis:ai.homeAnalysis||null,
-      awayAnalysis:ai.awayAnalysis||null, keyStatInsight:ai.keyStatInsight||null,
-      flagReason: flagged ? flagReason : null,
-      message: flagged
-        ? 'Stats board verified. Result flagged for admin review — you will be notified.'
-        : 'Stats board verified. Score sealed. Awaiting opponent submission.'
-    });
+      // ── CEE INTELLIGENCE: Stat cross-validation ──────────────────────────────
+      // Both players have now submitted. Compare the 14 stats extracted from each
+      // screenshot. For a genuine match, both boards show the same numbers.
+      // Any significant mismatch means the screenshots are from different matches.
+      try {
+        const statsA = fresh.aiStatsA || {};
+        const statsB = fresh.aiStatsB || {};
+        const statKeys = ['shotsHome','shotsAway','shotsOnTargetHome','shotsOnTargetAway',
+                          'foulsHome','foulsAway','offsidesHome','offsidesAway',
+                          'cornerKicksHome','cornerKicksAway','freeKicksHome','freeKicksAway',
+                          'passesHome','passesAway','successfulPassesHome','successfulPassesAway',
+                          'crossesHome','crossesAway','interceptionsHome','interceptionsAway',
+                          'tacklesHome','tacklesAway','savesHome','savesAway'];
+        const mismatches = [];
+        let comparableStats = 0;
+        for (const key of statKeys) {
+          const vA = statsA[key], vB = statsB[key];
+          if (vA !== null && vA !== undefined && vB !== null && vB !== undefined) {
+            comparableStats++;
+            if (vA !== vB) mismatches.push(`${key}: A=${vA} B=${vB}`);
+          }
+        }
+        // Possession: allow ±3% tolerance due to display rounding
+        const posHA = statsA.possessionHome, posHB = statsB.possessionHome;
+        if (posHA !== null && posHA !== undefined && posHB !== null && posHB !== undefined) {
+          comparableStats++;
+          if (Math.abs(posHA - posHB) > 3) mismatches.push(`possessionHome: A=${posHA} B=${posHB}`);
+        }
+        // Significant mismatch threshold: if we have enough comparable stats AND
+        // more than 20% of them differ, flag as stat mismatch.
+        const mismatchRatio = comparableStats > 0 ? mismatches.length / comparableStats : 0;
+        let _statMismatchDetected = false;
+        if (comparableStats >= 6 && mismatchRatio > 0.2) {
+          _statMismatchDetected = true;
+          const mismatchDetail = `Stat mismatch (${mismatches.length}/${comparableStats} fields differ): ${mismatches.slice(0,5).join('; ')}`;
+          // INTEL-06 FIX: escalate directly to admin_arbitration — do NOT enter pending_approval pipeline.
+          // screenshotFlaggedForReview alone only delays auto-approval by 48hr; this makes it require
+          // explicit admin resolution before the result is ever recorded.
+          await fixRef.update({
+            statMismatchFlag: true,
+            statMismatchDetail: mismatchDetail,
+            screenshotFlaggedForReview: true,
+            screenshotFlagReason: mismatchDetail,
+            status: 'admin_arbitration',
+            statMismatchArbitrationAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+          await audit('ANTICHEAT_STAT_MISMATCH', fixtureId, 'fixture', mismatchDetail);
+          const adminChat = env.telegram && env.telegram.admin_chat_id;
+          if (adminChat) {
+            sendTelegram(adminChat, `🚨 <b>Stat Mismatch — Admin Action Required</b>\nFixture: ${fixtureId}\n${mismatchDetail}\nScreenshots appear to be from different matches.\n⚠️ Fixture moved to admin_arbitration — requires manual resolution.`).catch(()=>{});
+          }
+          console.warn(`[CEE] Stat mismatch on fixture ${fixtureId}: moved to admin_arbitration. ${mismatchDetail}`);
+        }
+      } catch(svErr){ console.error('[CEE] Stat cross-validation error:', svErr.message); }
+
+      // INTEL-06 FIX: skip score cross-validation entirely when screenshots are confirmed
+      // to be from different matches — there is nothing valid to cross-validate.
+      if (!_statMismatchDetected) {
+        await _crossValidateScores(fixtureId,fresh);
+      }
+    } else { await logNotif(fixtureId,playerId,'telegram','SUBMISSION_RECEIVED','sent'); }
+
+    return res.json({ success:true, confidence:conf, message:'Screenshot sealed. Awaiting opponent submission.' });
   } catch(e){ console.error('[CEE] submitScore:',e); return res.status(500).json({ success:false, message:'Server error: '+e.message }); }
 });
 
@@ -2438,7 +2514,7 @@ app.post('/testNotification', async (req, res) => {
           } else {
             const info = await sendEmail(testTo,
               'CEE — Test Email ✅',
-              `<p>✅ Brevo email is working correctly!</p><div class="hl">Sender: ${acct.name}<br>Account ${_brevoAccounts.indexOf(acct)+1} of ${_brevoAccounts.length} — ${acct.sentToday} emails used today</div>`
+              `<p>✅ Brevo email is working correctly!</p><div class="hl">Sent from: ${acct.from}<br>Account ${_brevoAccounts.indexOf(acct)+1} of ${_brevoAccounts.length} — ${acct.sentToday} emails used today</div>`
             );
             results.email = info.success
               ? { ok: true, to: testTo }
@@ -2833,51 +2909,6 @@ app.post('/liftForceMajeure', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════════════════
-// POST /approveResult — admin manually approves a pending_approval fixture
-// Writes to Firestore AND sends RESULT_APPROVED notifications to both players.
-// Use this instead of writing directly to Firestore from the admin UI so that
-// players actually receive their approval notification.
-// ═══════════════════════════════════════════════════════════════════════════
-app.post('/approveResult', async (req, res) => {
-  if (!assertAdminSecret(req, res)) return;
-  const { fixtureId } = req.body;
-  if (!fixtureId) return res.status(400).json({ success: false, message: 'Missing fixtureId' });
-  try {
-    const fixRef  = db.collection('fixtures').doc(fixtureId);
-    const fixSnap = await fixRef.get();
-    if (!fixSnap.exists) return res.status(404).json({ success: false, message: 'Fixture not found' });
-    const fix = fixSnap.data();
-
-    if (fix.adminApproved) return res.json({ success: false, message: 'Already approved.' });
-
-    await fixRef.update({
-      adminApproved:   true,
-      adminApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
-      status:          'approved',
-      done:            true,
-      adminOverride:   false
-    });
-
-    await audit('APPROVE_RESULT', fixtureId, 'fixture', 'Admin manually approved result');
-
-    // Notify both players — this is what the direct-Firestore-write path was missing
-    const seasonId = fix.seasonId;
-    await _sendMatchNotifications('RESULT_APPROVED', fixtureId, fix.playerAId, fix.playerBId, seasonId);
-
-    // Recalculate standings
-    if (seasonId) {
-      await _recalcStandingsInternal(seasonId).catch(e => console.error('[CEE] approveResult recalc:', e));
-      await _checkKnockoutQualification(seasonId).catch(e => console.error('[CEE] approveResult knockout:', e));
-    }
-
-    return res.json({ success: true, message: 'Result approved and players notified.' });
-  } catch(e) {
-    console.error('[CEE] approveResult:', e);
-    return res.status(500).json({ success: false, message: e.message });
-  }
-});
-
 // POST /recalculateStandings
 // ═══════════════════════════════════════════════════════════════════════════
 app.post('/recalculateStandings', async (req, res) => {
@@ -3506,80 +3537,6 @@ async function runSubmissionDeadlineEnforcer() {
     await db.collection('seasons').doc(seasonId).update({standingsDirty:true}).catch(()=>{});
     await _recalcStandingsInternal(seasonId); await _checkKnockoutQualification(seasonId);
   }
-
-  // ── 15-minute opponent upload deadline ────────────────────────────────────
-  // Fires when the first-submitter's opponent hasn't uploaded within 15 min.
-  // Requires Firestore composite index: seasonId + status + opponentUploadDeadline
-  try {
-    const oppSnap = await db.collection('fixtures')
-      .where('seasonId','==',seasonId)
-      .where('status','==','in_progress')
-      .where('opponentUploadDeadline','<=',nowTs).get();
-    const oppBatch = db.batch(); const oppNotifys = [];
-    for (const doc of oppSnap.docs) {
-      const f = doc.data();
-      const aIn = !!f.playerASubmittedAt, bIn = !!f.playerBSubmittedAt;
-      // Only act when exactly ONE player has submitted
-      if (aIn && !bIn) {
-        oppBatch.update(doc.ref, {
-          status:'approved', result:'FORFEIT_B', isForfeit:true,
-          playerAGoals:3, playerBGoals:0, adminApproved:true, done:true,
-          forfeitReason:'15-minute opponent upload deadline expired',
-          autoApprovedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        oppNotifys.push({type:'FORFEIT_APPLIED',fixtureId:doc.id,pA:f.playerAId,pB:f.playerBId});
-        audit('OPPONENT_DEADLINE_FORFEIT',doc.id,'fixture','Player B forfeited — missed 15-min upload window').catch(()=>{});
-      } else if (!aIn && bIn) {
-        oppBatch.update(doc.ref, {
-          status:'approved', result:'FORFEIT_A', isForfeit:true,
-          playerAGoals:0, playerBGoals:3, adminApproved:true, done:true,
-          forfeitReason:'15-minute opponent upload deadline expired',
-          autoApprovedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        oppNotifys.push({type:'FORFEIT_APPLIED',fixtureId:doc.id,pA:f.playerAId,pB:f.playerBId});
-        audit('OPPONENT_DEADLINE_FORFEIT',doc.id,'fixture','Player A forfeited — missed 15-min upload window').catch(()=>{});
-      }
-      // Both submitted or neither submitted — do nothing (handled by other paths)
-    }
-    await oppBatch.commit();
-    for (const n of oppNotifys) await _sendMatchNotifications(n.type,n.fixtureId,n.pA,n.pB,seasonId);
-    if (oppNotifys.length) {
-      await db.collection('seasons').doc(seasonId).update({standingsDirty:true}).catch(()=>{});
-      await _recalcStandingsInternal(seasonId); await _checkKnockoutQualification(seasonId);
-    }
-  } catch(e) { console.error('[CEE] opponentDeadlineCheck:',e.message); }
-
-  // ── 6-minute stats mismatch reupload deadline ─────────────────────────────
-  // Fires when the 6-min reupload window expires → DOUBLE_FORFEIT both players.
-  // Requires Firestore composite index: seasonId + status + statsMismatchReuploadWindow + statsMismatchReuploadDeadline
-  try {
-    const mmSnap = await db.collection('fixtures')
-      .where('seasonId','==',seasonId)
-      .where('status','==','in_progress')
-      .where('statsMismatchReuploadWindow','==',true)
-      .where('statsMismatchReuploadDeadline','<=',nowTs).get();
-    const mmBatch = db.batch(); const mmNotifys = [];
-    for (const doc of mmSnap.docs) {
-      const f = doc.data();
-      mmBatch.update(doc.ref, {
-        status:'approved', result:'DOUBLE_FORFEIT',
-        isForfeit:true, playerAGoals:0, playerBGoals:0,
-        adminApproved:true, done:true,
-        statsMismatchReuploadWindow: false,
-        doubleForfeitReason:'Stats mismatch 6-minute reupload window expired',
-        autoApprovedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-      mmNotifys.push({type:'DOUBLE_FORFEIT',fixtureId:doc.id,pA:f.playerAId,pB:f.playerBId});
-      audit('REUPLOAD_DOUBLE_FORFEIT',doc.id,'fixture','Double forfeit — stats mismatch reupload deadline expired').catch(()=>{});
-    }
-    await mmBatch.commit();
-    for (const n of mmNotifys) await _sendMatchNotifications(n.type,n.fixtureId,n.pA,n.pB,seasonId);
-    if (mmNotifys.length) {
-      await db.collection('seasons').doc(seasonId).update({standingsDirty:true}).catch(()=>{});
-      await _recalcStandingsInternal(seasonId); await _checkKnockoutQualification(seasonId);
-    }
-  } catch(e) { console.error('[CEE] statsMismatchReuploadCheck:',e.message); }
-
   console.log(`[CEE] submissionDeadlineEnforcer: processed ${snap.size}`);
 }
 cron.schedule('*/10 * * * *', () => runSubmissionDeadlineEnforcer().catch(e => console.error('[CEE] submissionDeadlineEnforcer error:',e)));
@@ -3624,13 +3581,8 @@ async function runAutoApprover() {
   const flagged48=await db.collection('fixtures').where('seasonId','==',seasonId)
     .where('status','==','pending_approval').where('screenshotFlaggedForReview','==',true).get();
   for (const doc of flagged48.docs) {
-    const f=doc.data(); if (!f.playerASubmittedAt && !f.playerBSubmittedAt) continue;
-    // Use the LATER of the two submission timestamps so admin gets the full 48hr window
-    // from when BOTH screenshots were available, not just when the first one arrived.
-    const tsA = f.playerASubmittedAt ? fromTS(f.playerASubmittedAt) : null;
-    const tsB = f.playerBSubmittedAt ? fromTS(f.playerBSubmittedAt) : null;
-    const lastSubmittedAt = (tsA && tsB) ? (tsA > tsB ? tsA : tsB) : (tsA || tsB);
-    const hoursElapsed=nowWAT().diff(lastSubmittedAt,'hours').hours;
+    const f=doc.data(); if (!f.playerASubmittedAt) continue;
+    const hoursElapsed=nowWAT().diff(fromTS(f.playerASubmittedAt),'hours').hours;
     if (hoursElapsed>=48) {
       batch.update(doc.ref,{adminApproved:true,status:'approved',done:true,
         autoApprovedAt:admin.firestore.FieldValue.serverTimestamp(),
@@ -4021,165 +3973,1516 @@ db.collection('registrations').onSnapshot(snapshot => {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ADMIN: TEST AI VERIFIER — Full Blueprint breakdown (adminVerifyScreenshot)
-// POST /adminVerifyScreenshot  { imageBase64, mimeType, homeIdentifiers, awayIdentifiers, fixtureId? }
-// Returns full 6-clue breakdown for debugging, disputes, and system testing.
+// POST /analyzeOpponent — CEE Intelligence System
+// Generates a scouting report on a player's upcoming opponent using stored
+// matchStats and the 6-phase eFootball Analysis Engine via Gemini.
+// Implements caching: report is reused until opponent plays a new match.
 // ═══════════════════════════════════════════════════════════════════════════
-app.post('/adminVerifyScreenshot', async (req, res) => {
-  if (!assertAdminSecret(req, res)) return;
-  const { imageBase64, mimeType, homeIdentifiers, awayIdentifiers, fixtureId } = req.body;
-  if (!imageBase64) return res.status(400).json({ success: false, message: 'Missing imageBase64' });
-  try {
-    // Allow passing identifiers directly or loading from a fixture
-    let hId = homeIdentifiers || { clubName:'', gameName:'', initials:'' };
-    let aId = awayIdentifiers || { clubName:'', gameName:'', initials:'' };
-    if (fixtureId && !homeIdentifiers) {
-      try {
-        const fixSnap = await db.collection('fixtures').doc(fixtureId).get();
-        if (fixSnap.exists) {
-          const fd = fixSnap.data();
-          const [pA, pB] = await Promise.all([
-            fd.playerAId ? db.collection('players').doc(fd.playerAId).get() : null,
-            fd.playerBId ? db.collection('players').doc(fd.playerBId).get() : null
-          ]);
-          if (pA && pA.exists) { const d=pA.data(); hId={clubName:d.clubName||'',gameName:d.gameName||'',initials:d.initials||''}; }
-          if (pB && pB.exists) { const d=pB.data(); aId={clubName:d.clubName||'',gameName:d.gameName||'',initials:d.initials||''}; }
-        }
-      } catch(fErr){ console.error('[CEE] adminVerifyScreenshot fixture load:', fErr.message); }
-    }
+app.post('/analyzeOpponent', async (req, res) => {
+  const { requestingPlayerId, opponentPlayerId, seasonId, fixtureId } = req.body;
+  if (!requestingPlayerId || !opponentPlayerId || !seasonId) {
+    return res.status(400).json({ success: false, message: 'Missing required fields.' });
+  }
 
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.gemini.key}`;
-    const geminiPrompt=`You are the CEE (Campus eSports Elite) AI Match Verifier.
-CEE is a competitive eFootball (Konami soccer video game) campus tournament platform.
-Your task is to analyse the submitted screenshot and extract structured match data.
-
-// ─── FIXTURE CONTEXT ───────────────────────────────────────────────────────
-Home Player: Club="${hId.clubName}" | GameTag="${hId.gameName}" | Initials="${hId.initials}"
-Away Player: Club="${aId.clubName}" | GameTag="${aId.gameName}" | Initials="${aId.initials}"
-
-// ─── WHAT A VALID EFOOTBALL STATS BOARD LOOKS LIKE ────────────────────────
-A VALID eFootball stats board has ALL of these elements:
-  1. SCORE BANNER: Dark navy blue horizontal band. Home name LEFT (yellow bold), Away name RIGHT (yellow bold). Two yellow score boxes flanking the eFootball "e" logo.
-  2. TIMELINE BAR: Solid yellow/gold bar below score banner. Shows: "Full Time", "Full Time (AET)", "Penalty Shootout", "Half Time", or "Interval". ONLY "Full Time", "Full Time (AET)", "Penalty Shootout" are accepted for CEE.
-  3. STATS TABLE: Dark navy 3-column layout: [Home] | [Stat] | [Away]. Rows: Possession, Shots, Shots on Target, Fouls, Offsides, Corner Kicks, Free Kicks, Passes, Successful Passes, Crosses, Interceptions, Tackles, Saves.
-  4. SIDE AREAS: Yellow/gold with diagonal navy chevron pattern. Team badge in centre.
-  5. NAVIGATION button at bottom (cyan): "Next ›" = Full Time or later. "‹ Back" = Half Time.
-
-REJECT (isEfootballStatsBoard=false) if: pause menu, pre-match, in-game HUD, photo of phone, social media, non-efootball.
-
-STEP 1 — Timeline. STEP 2 — Score. STEP 3 — Names + fuzzy match. STEP 4 — Key stats. STEP 5 — Anti-cheat. STEP 6 — Analysis.
-
-homeNameMatch/awayNameMatch: "yes"=80%+, "partial"=50-79%, "no"=below 50%.
-suspiciousScoreToShots: homeGoals>=5 AND shotsOnTargetHome<=1, OR awayGoals>=5 AND shotsOnTargetAway<=1.
-extremeScore: |homeGoals-awayGoals|>=10 OR either>15.
-homeAwaySwap: home name matches AWAY identifiers AND away name matches HOME identifiers.
-
-Respond ONLY with valid JSON. No markdown. No code fences.
-{
-  "isEfootballStatsBoard": true/false,
-  "screenType": "string",
-  "timelineLabel": "string or null",
-  "timelineAccepted": true/false,
-  "homeTeamName": "string or null",
-  "awayTeamName": "string or null",
-  "homeNameMatch": "yes"/"partial"/"no",
-  "awayNameMatch": "yes"/"partial"/"no",
-  "homeGoals": integer or null,
-  "awayGoals": integer or null,
-  "shotsOnTargetHome": integer or null,
-  "shotsOnTargetAway": integer or null,
-  "foulsHome": integer or null,
-  "foulsAway": integer or null,
-  "tacklesHome": integer or null,
-  "tacklesAway": integer or null,
-  "offsidesHome": integer or null,
-  "offsidesAway": integer or null,
-  "suspiciousScoreToShots": false,
-  "extremeScore": false,
-  "homeAwaySwap": false,
-  "matchSummary": "string or null",
-  "homeAnalysis": { "strengths": [], "improvements": [] } or null,
-  "awayAnalysis": { "strengths": [], "improvements": [] } or null,
-  "keyStatInsight": "string or null",
-  "confidence": 0.0-1.0,
-  "rejectionReason": "string or null"
-}`;
-    const cr = await fetch(geminiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [
-          { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } },
-          { text: geminiPrompt }
-        ]}],
-        generationConfig: { maxOutputTokens: 2500, temperature: 0, responseMimeType: 'application/json' }
-      })
-    });
-    const cd = await cr.json();
-
-    // ── Detect Gemini API errors before attempting to parse ────────────────
-    if (cd.error) {
-      return res.json({ success: false, message: `Gemini API error: ${cd.error.message || JSON.stringify(cd.error)}` });
-    }
-    if (!cd.candidates || !cd.candidates[0]) {
-      const reason = cd.promptFeedback ? JSON.stringify(cd.promptFeedback) : 'No candidates returned';
-      return res.json({ success: false, message: `Gemini returned no result. ${reason}` });
-    }
-    const candidatePart = cd.candidates[0];
-    if (!candidatePart.content || !candidatePart.content.parts || !candidatePart.content.parts[0] || !candidatePart.content.parts[0].text) {
-      const finishReason = candidatePart.finishReason || 'unknown';
-      return res.json({ success: false, message: `Gemini returned empty content. Finish reason: ${finishReason}. The image may have been blocked by safety filters.` });
-    }
-    const rawText = candidatePart.content.parts[0].text;
-
-    let ai;
+  // ── Auth: verify the requesting player via PIN header ───────────────────
+  const pinHeader = req.headers['x-cee-player-pin'];
+  if (pinHeader) {
     try {
-      const cleaned = rawText.replace(/```json\s*/gi,'').replace(/```\s*/g,'').trim();
-      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) throw new Error('No JSON object found in response');
-      ai = JSON.parse(jsonMatch[0]);
-    } catch(parseErr) {
-      return res.json({ success: false, message: `Gemini returned invalid JSON: ${parseErr.message}. Raw response: ${rawText.slice(0, 300)}` });
-    }
-    const conf = ai.confidence || 0;
+      const secretDoc = await db.collection('playerSecrets').doc(requestingPlayerId).get();
+      if (secretDoc.exists) {
+        const secrets = secretDoc.data();
+        if (secrets.pinHash) {
+          const valid = await bcrypt.compare(pinHeader, secrets.pinHash);
+          if (!valid) return res.status(401).json({ success: false, message: 'Authentication failed.' });
+        }
+      }
+    } catch(authErr) { console.error('[CEE] analyzeOpponent auth error:', authErr.message); }
+  }
 
-    // Build clue-by-clue breakdown for admin UI
-    // NOTE: use ai.homeGoals != null (!=, not !==) to catch both null AND undefined
-    const scoreReadable = ai.homeGoals != null && ai.awayGoals != null;
-    const clues = [
-      { id:'C1', name:'Stats Board Structure', passed: !!ai.isEfootballStatsBoard, detail: ai.screenType||'unknown' },
-      { id:'C2', name:'Timeline Label = Full Time', passed: !!ai.timelineAccepted, detail: ai.timelineLabel||'unknown' },
-      { id:'C3', name:'Score Readable', passed: scoreReadable, detail: scoreReadable ? `${ai.homeGoals}-${ai.awayGoals}` : 'unreadable' },
-      { id:'C4', name:'Home Name Match', passed: ai.homeNameMatch==='yes'||ai.homeNameMatch==='partial', detail: `${ai.homeTeamName||'?'} → ${ai.homeNameMatch||'unknown'}` },
-      { id:'C5', name:'Away Name Match', passed: ai.awayNameMatch==='yes'||ai.awayNameMatch==='partial', detail: `${ai.awayTeamName||'?'} → ${ai.awayNameMatch||'unknown'}` },
-      { id:'C6', name:'Stats Plausibility', passed: !ai.suspiciousScoreToShots&&!ai.extremeScore, detail: ai.suspiciousScoreToShots?'suspicious score/shots':ai.extremeScore?'extreme score':'ok' }
-    ];
-    const passCount = clues.filter(c => c.passed).length;
-    let verdict = 'rejected';
-    if (ai.isEfootballStatsBoard && ai.timelineAccepted) {
-      if (passCount >= 5 && conf >= 0.85) verdict = 'approved';
-      else if (passCount >= 4 || conf >= 0.60) verdict = 'needs_review';
+  try {
+    // ── Check if Intelligence feature is enabled ────────────────────────────
+    const intelConfig = await db.collection('config').doc('intelligence').get();
+    const analysisEnabled = !intelConfig.exists || intelConfig.data().analysisEnabled !== false;
+    if (!analysisEnabled) {
+      return res.json({ success: false, reason: 'disabled', message: 'Analysis feature temporarily unavailable. Check back soon.' });
     }
+
+    // ── Fetch opponent match history (this season) ──────────────────────────
+    const oppMatchSnap = await db.collection('matchStats')
+      .where('playerId', '==', opponentPlayerId)
+      .where('seasonId', '==', seasonId)
+      .orderBy('verifiedAt', 'asc')
+      .get();
+
+    if (oppMatchSnap.empty) {
+      return res.json({ success: false, reason: 'no_data', message: 'No match data available for this opponent yet. Check back after they play their first match.' });
+    }
+
+    const allOppMatches = [];
+    oppMatchSnap.forEach(d => allOppMatches.push({ _id: d.id, ...d.data() }));
+    const latestOppMatch = allOppMatches[allOppMatches.length - 1];
+
+    // ── Cache check ─────────────────────────────────────────────────────────
+    const reportDocId = `${requestingPlayerId}_${opponentPlayerId}_${seasonId}`;
+    const cachedSnap = await db.collection('scoutReports').doc(reportDocId).get();
+    let cachedReport = cachedSnap.exists ? cachedSnap.data() : null;
+
+    if (cachedReport && cachedReport.opponentLastMatchId === latestOppMatch._id) {
+      return res.json({
+        success: true,
+        cached: true,
+        reportText: cachedReport.reportText,
+        upgradeText: cachedReport.upgradeText,
+        matchesAnalysed: cachedReport.matchesAnalysed,
+        opponentName: cachedReport.opponentName || null,
+        generatedAt: cachedReport.generatedAt ? cachedReport.generatedAt.toDate().toISOString() : null
+      });
+    }
+
+    // ── Fetch requesting player match history ───────────────────────────────
+    const myMatchSnap = await db.collection('matchStats')
+      .where('playerId', '==', requestingPlayerId)
+      .where('seasonId', '==', seasonId)
+      .orderBy('verifiedAt', 'asc')
+      .get();
+    const myMatches = [];
+    myMatchSnap.forEach(d => myMatches.push({ _id: d.id, ...d.data() }));
+
+    // ── Fetch both player profiles ──────────────────────────────────────────
+    const [reqPlayerDoc, oppPlayerDoc] = await Promise.all([
+      db.collection('players').doc(requestingPlayerId).get(),
+      db.collection('players').doc(opponentPlayerId).get()
+    ]);
+    const reqPlayer = reqPlayerDoc.exists ? { id: reqPlayerDoc.id, ...reqPlayerDoc.data() } : { id: requestingPlayerId, clubName: 'Unknown', gameName: 'Unknown', stats: {} };
+    const oppPlayer = oppPlayerDoc.exists ? { id: oppPlayerDoc.id, ...oppPlayerDoc.data() } : { id: opponentPlayerId, clubName: 'Unknown', gameName: 'Unknown', stats: {} };
+
+    // ── Use last 5 opponent matches ─────────────────────────────────────────
+    const oppMatches = allOppMatches.slice(-5);
+    const matchesAnalysed = oppMatches.length;
+
+    // INTEL-05 FIX: Fetch the opposing player's matchStats doc for each fixture so the
+    // opponent column in the Gemini prompt is filled with real numbers instead of all --.
+    // Each matchStats doc is keyed as {fixtureId}_{playerId}, so the other side is
+    // {fixtureId}_{m.opponentId} where m.opponentId is the other participant.
+    const oppSideStatsMap = {};
+    await Promise.allSettled(oppMatches.map(async m => {
+      if (!m.fixtureId || !m.opponentId) return;
+      try {
+        const sideDoc = await db.collection('matchStats').doc(`${m.fixtureId}_${m.opponentId}`).get();
+        if (sideDoc.exists) oppSideStatsMap[m.fixtureId] = sideDoc.data().stats || {};
+      } catch(e) { /* non-fatal: column stays -- */ }
+    }));
+
+    // ── Calculate requesting player averages ────────────────────────────────
+    function _avg(arr, fn) {
+      const vals = arr.map(fn).filter(v => v !== null && v !== undefined);
+      return vals.length ? Math.round(vals.reduce((a,b) => a+b, 0) / vals.length) : null;
+    }
+    const myAvgPossession  = _avg(myMatches, m => m.stats && m.stats.possession);
+    const myAvgPassAcc     = myMatches.length > 0 ? (() => {
+      const vals = myMatches.map(m => {
+        if (m.stats && m.stats.passes && m.stats.successfulPasses && m.stats.passes > 0)
+          return Math.round((m.stats.successfulPasses / m.stats.passes) * 100);
+        return null;
+      }).filter(v => v !== null);
+      return vals.length ? Math.round(vals.reduce((a,b) => a+b,0)/vals.length) : null;
+    })() : null;
+    const myAvgShots       = _avg(myMatches, m => m.stats && m.stats.shots);
+    const myAvgShotsOnTarget = _avg(myMatches, m => m.stats && m.stats.shotsOnTarget);
+    // Most common formation
+    const formationCounts = {};
+    myMatches.forEach(m => { if (m.context && m.context.formation) { const f = m.context.formation; formationCounts[f] = (formationCounts[f]||0)+1; } });
+    const myFormation = Object.keys(formationCounts).sort((a,b) => formationCounts[b]-formationCounts[a])[0] || 'Unknown';
+    const myAttackDir = (() => {
+      const dirs = myMatches.map(m => m.context && m.context.attackDirection).filter(Boolean);
+      const wingCount = dirs.filter(d => d === 'wings').length;
+      return dirs.length ? (wingCount >= dirs.length/2 ? 'wings' : 'middle') : 'unknown';
+    })();
+
+    const reqStats = reqPlayer.stats || {};
+
+    // ── Fetch tier data for both players ────────────────────────────────────
+    const reqTier = reqPlayer.playerTier || null;
+    const oppTier = oppPlayer.playerTier || null;
+    const reqPR   = reqPlayer.performanceRating != null ? reqPlayer.performanceRating : null;
+    const oppPR   = oppPlayer.performanceRating != null ? oppPlayer.performanceRating : null;
+    const reqTierMatches = reqPlayer.tierMatchCount || 0;
+    const oppTierMatches = oppPlayer.tierMatchCount || 0;
+
+    // Tier labels for prompt injection
+    const _tierLabel = (tier, pr, matchCount) => {
+      if (!tier || matchCount < 4) return 'UNRANKED (fewer than 4 matches)';
+      const emoji = tier === 'elite' ? '🔴 ELITE' : tier === 'mid' ? '🟡 MID' : '⚪ UNDERDOG';
+      return `${emoji} (PR: ${pr !== null ? pr : '—'}, based on ${matchCount} matches)`;
+    };
+    const reqTierLabel = _tierLabel(reqTier, reqPR, reqTierMatches);
+    const oppTierLabel = _tierLabel(oppTier, oppPR, oppTierMatches);
+
+    // Matchup classification
+    let tierMatchup = '';
+    if (reqTier && oppTier && reqTierMatches >= 4 && oppTierMatches >= 4) {
+      if (reqTier === oppTier)            tierMatchup = 'EVEN MATCHUP — Both players at same tier level';
+      else if (reqTier === 'elite'  && oppTier !== 'elite')  tierMatchup = 'FAVOURITE — You are the higher-rated player in this fixture';
+      else if (reqTier === 'underdog' && oppTier !== 'underdog') tierMatchup = 'UNDERDOG — You are the lower-rated player in this fixture';
+      else if (oppTier === 'elite'  && reqTier !== 'elite')  tierMatchup = 'UNDERDOG — Your opponent is rated higher than you';
+      else                                tierMatchup = 'CONTESTED — Slight tier gap but not decisive';
+    } else {
+      tierMatchup = 'UNCLASSIFIED — Insufficient match data for one or both players';
+    }
+
+    // ── TREND ENGINE — Opponent statistical trajectory analysis ─────────────
+    // Uses chronologically ordered oppMatches (already slice(-5), oldest→newest).
+    // Splits into first half and second half to detect improvement/decline.
+    // All calculations are non-fatal — if data is thin, labels say "Insufficient data".
+    const _trendAvg = (arr, fn) => {
+      const vals = arr.map(fn).filter(v => v !== null && v !== undefined && !isNaN(v));
+      return vals.length ? vals.reduce((a,b) => a+b, 0) / vals.length : null;
+    };
+    const _trendPassAcc = m => (m.stats && m.stats.passes > 0 && m.stats.successfulPasses != null)
+      ? (m.stats.successfulPasses / m.stats.passes) * 100 : null;
+    const _trendShotQual = m => (m.stats && m.stats.shots > 0 && m.stats.shotsOnTarget != null)
+      ? (m.stats.shotsOnTarget / m.stats.shots) * 100 : null;
+    const _trendGF = m => m.goalsFor != null ? m.goalsFor : null;
+    const _trendGA = m => m.goalsAgainst != null ? m.goalsAgainst : null;
+    const _trendPoss = m => (m.stats && m.stats.possession != null) ? m.stats.possession : null;
+    const _trendShots = m => (m.stats && m.stats.shots != null) ? m.stats.shots : null;
+    const _trendInter = m => (m.stats && m.stats.interceptions != null) ? m.stats.interceptions : null;
+
+    // Split matches into early (first half) and recent (second half) for trajectory
+    const trendMid = Math.ceil(oppMatches.length / 2);
+    const trendEarly  = oppMatches.slice(0, trendMid);
+    const trendRecent = oppMatches.slice(trendMid);
+
+    const _trendDir = (earlyVal, recentVal, label, higherIsBetter = true) => {
+      if (earlyVal === null || recentVal === null) return `${label}: Insufficient data`;
+      const diff = recentVal - earlyVal;
+      const pct  = earlyVal !== 0 ? Math.round(Math.abs(diff) / earlyVal * 100) : 0;
+      if (Math.abs(diff) < 0.5) return `${label}: Stable (${recentVal.toFixed(1)})`;
+      const improving = higherIsBetter ? diff > 0 : diff < 0;
+      const arrow = improving ? '↑ IMPROVING' : '↓ DECLINING';
+      return `${label}: ${arrow} ${earlyVal.toFixed(1)} → ${recentVal.toFixed(1)} (${pct}% shift)`;
+    };
+
+    // Results sequence for streak analysis
+    const resultSeq = oppMatches.map(m => m.result || '?');
+    const recentResults = resultSeq.slice(-3);
+    const wins3   = recentResults.filter(r => r === 'W').length;
+    const losses3  = recentResults.filter(r => r === 'L').length;
+    let formStreak = '';
+    if (wins3 === 3)        formStreak = '🔥 HOT STREAK — Won last 3';
+    else if (wins3 === 2)   formStreak = '📈 Good form — 2 of last 3 won';
+    else if (losses3 === 3) formStreak = '❄️ COLD STREAK — Lost last 3';
+    else if (losses3 === 2) formStreak = '📉 Poor form — Lost 2 of last 3';
+    else                    formStreak = '〰 Mixed form — No clear streak';
+
+    // Formation stability
+    const oppFormations = oppMatches.map(m => m.context && m.context.formation).filter(Boolean);
+    const oppFormSet = [...new Set(oppFormations)];
+    let formationStability = '';
+    if (oppFormations.length === 0)       formationStability = 'No formation data recorded';
+    else if (oppFormSet.length === 1)     formationStability = `Rigid — always plays ${oppFormSet[0]}`;
+    else if (oppFormSet.length === 2)     formationStability = `Dual setup — alternates ${oppFormSet.join(' / ')}`;
+    else                                  formationStability = `Tactical variety — used ${oppFormSet.join(', ')}`;
+
+    // Scoring pattern: goals per match trend
+    const earlyGF   = _trendAvg(trendEarly,  _trendGF);
+    const recentGF  = _trendAvg(trendRecent, _trendGF);
+    const earlyGA   = _trendAvg(trendEarly,  _trendGA);
+    const recentGA  = _trendAvg(trendRecent, _trendGA);
+    const earlyPassAcc  = _trendAvg(trendEarly,  _trendPassAcc);
+    const recentPassAcc = _trendAvg(trendRecent, _trendPassAcc);
+    const earlyShotQ    = _trendAvg(trendEarly,  _trendShotQual);
+    const recentShotQ   = _trendAvg(trendRecent, _trendShotQual);
+    const earlyPoss     = _trendAvg(trendEarly,  _trendPoss);
+    const recentPoss    = _trendAvg(trendRecent, _trendPoss);
+    const earlyShots    = _trendAvg(trendEarly,  _trendShots);
+    const recentShots   = _trendAvg(trendRecent, _trendShots);
+    const earlyInter    = _trendAvg(trendEarly,  _trendInter);
+    const recentInter   = _trendAvg(trendRecent, _trendInter);
+
+    // Weighted overall form score (recent matches count double)
+    const oppAllGoalsFor = oppMatches.map(_trendGF).filter(v => v !== null);
+    const oppAllGoalsAgainst = oppMatches.map(_trendGA).filter(v => v !== null);
+    const oppTotalGF = oppAllGoalsFor.reduce((a,b) => a+b, 0);
+    const oppTotalGA = oppAllGoalsAgainst.reduce((a,b) => a+b, 0);
+    const oppGD = oppTotalGF - oppTotalGA;
+
+    // Context trend: are they pressing more / sitting back more recently?
+    const recentPressing  = oppMatches.slice(-3).filter(m => m.context && m.context.opponentPressing === true).length;
+    const recentDefensive = oppMatches.slice(-3).filter(m => m.context && m.context.opponentDefensive === true).length;
+    let tacticalTrend = '';
+    if (recentPressing >= 2)       tacticalTrend = 'Increasingly aggressive — pressing more in recent matches';
+    else if (recentDefensive >= 2) tacticalTrend = 'Increasingly cautious — sitting deeper in recent matches';
+    else                           tacticalTrend = 'No clear tactical shift detected in recent matches';
+
+    // Assemble trend report block to inject into prompt
+    const TREND_REPORT = `
+════════════════════════════════════════════════════════════════
+TREND ANALYSIS ENGINE — \${oppPlayer.clubName} TRAJECTORY REPORT
+(\${oppMatches.length} matches analysed chronologically, oldest → newest)
+════════════════════════════════════════════════════════════════
+
+FORM STREAK:       \${formStreak}
+RESULT SEQUENCE:   \${resultSeq.join(' → ')} (W=Win D=Draw L=Loss)
+SEASON RECORD:     \${oppTotalGF} scored / \${oppTotalGA} conceded / GD \${oppGD >= 0 ? '+' : ''}\${oppGD}
+
+STATISTICAL TRAJECTORY (Early matches → Recent matches):
+  \${_trendDir('Goals scored/match',    earlyGF,      recentGF,      'GOALS SCORED/MATCH',   true)}
+  \${_trendDir('Goals conceded/match',  earlyGA,      recentGA,      'GOALS CONCEDED/MATCH',  false)}
+  \${_trendDir('Pass accuracy',         earlyPassAcc, recentPassAcc, 'PASS ACCURACY %',       true)}
+  \${_trendDir('Shot quality',          earlyShotQ,   recentShotQ,   'SHOT QUALITY RATIO %',  true)}
+  \${_trendDir('Possession',            earlyPoss,    recentPoss,    'POSSESSION %',          true)}
+  \${_trendDir('Shots per match',       earlyShots,   recentShots,   'SHOTS/MATCH',           true)}
+  \${_trendDir('Interceptions/match',   earlyInter,   recentInter,   'INTERCEPTIONS/MATCH',   true)}
+
+FORMATION PATTERN: \${formationStability}
+TACTICAL TREND:    \${tacticalTrend}
+
+INTERPRETATION RULES FOR TREND DATA:
+- ↑ IMPROVING in goals scored + ↑ shot quality = player is peaking — treat as current threat level
+- ↓ DECLINING in pass accuracy = build-up is breaking down — pressing their midfield may force errors
+- HOT STREAK opponent is psychologically confident — expect aggressive pressing mentality
+- COLD STREAK opponent may be desperate — higher risk of erratic play or tactical changes
+- Formation variety = adaptable player; rigid formation = predictable but potentially optimised
+- Increasing defensiveness (tactical trend) = they may be protecting a lead or lacking confidence
+════════════════════════════════════════════════════════════════`;
+
+    // ── eFootball Mechanics knowledge base ─────────────────────────────────
+    // ── eFootball Analysis Engine v2 (5 Phases + Tactical Upgrade Sub-Prompt) ─
+    const ANALYSIS_ENGINE_V2 = `╔══════════════════════════════════════════════════════════════╗
+║   eFOOTBALL MOBILE — DEEP MATCH ANALYSIS ENGINE v2          ║
+║   Phase 1: Orientation & Mental Model Construction          ║
+╚══════════════════════════════════════════════════════════════╝
+
+You are an elite eFootball Mobile analyst with expert knowledge
+of the game's mechanics — attacking/defensive styles, mentality
+sliders, player roles, the momentum system, and how stat lines
+reflect in-game behavior.
+
+Your task: perform a deep, eFootball-grounded analysis of the
+match statistics provided. Every finding must tie directly to
+how eFootball Mobile actually works.
+
+────────────────────────────────────────────────────────────────
+READ EVERYTHING BEFORE WRITING ANYTHING
+────────────────────────────────────────────────────────────────
+
+Before producing any output, build your mental model:
+
+  STEP 1 — READ THE SCORE
+  · What did each team need from this match?
+  · Does the scoreline reflect statistical dominance?
+  · Identify immediately: did the efficient team win or the
+    dominant team?
+
+  STEP 2 — CLASSIFY EACH TEAM'S LIKELY SETUP
+  Based on the stats, infer which eFootball attacking style
+  each team was running. Use these benchmarks:
+
+    Possession Game   → High passes, high pass accuracy (85%+),
+                        low direct shots, few crosses
+    Counter Attack    → Low possession, low passes, high shots
+                        from limited possesion, fast transitions
+    Long Ball Counter → Very low passes, low pass accuracy,
+                        high free kicks (winning fouls high up)
+    Out Wide          → High crosses (2+), wide shot angles,
+                        higher corner count
+    Center Attack     → High successful passes in tight areas,
+                        low crosses, shots from central zones
+
+  STEP 3 — CLASSIFY DEFENSIVE SHAPE
+  Infer each team's defensive style from:
+
+    Deep Defensive Line → High interceptions (sitting back),
+                          low tackles (waiting, not pressing),
+                          opponent has more possession
+    Frontline Pressure  → High tackles, opponent low pass
+                          accuracy (disrupted build-up)
+    Aggressive          → Very high interceptions + tackles
+                          combined, higher fouls possible
+    Possession Trap     → Opponent forced wide, low central
+                          shot attempts, high interceptions
+
+  STEP 4 — FLAG ZERO STATS AS TACTICAL SIGNALS
+  In eFootball, a zero is never neutral. Treat every zero as
+  a deliberate or forced tactical condition:
+
+    Crosses = 0     → Wing play was absent or completely shut down.
+                      Either Center Attack style, or opponent
+                      successfully forced play inside.
+    Corners = 0     → Never reached final third effectively, OR
+                      defense was too compact to concede corners.
+    Offsides = 0    → Either very disciplined runs, or no runs
+                      in behind at all (Deep-Lying Forward, no
+                      Goal Poacher making blind-side runs).
+
+  Complete this model silently. Then begin your report.
+
+════════════════════════════════════════════════════════════════
+
+╔══════════════════════════════════════════════════════════════╗
+║   eFOOTBALL MOBILE — DEEP MATCH ANALYSIS ENGINE v2          ║
+║   Phase 2: Active Investigation Rules                       ║
+╚══════════════════════════════════════════════════════════════╝
+
+Apply ALL six rules to every stat without exception.
+
+────────────────────────────────────────────────────────────────
+RULE 1 — SHOT QUALITY IS THE ONLY ATTACKING TRUTH
+────────────────────────────────────────────────────────────────
+
+  In eFootball, shots are not equal. Shot quality depends on:
+  · Body position when shooting
+  · Distance from goal
+  · Pressure from defenders (affects finesse shot accuracy)
+  · Player's Finishing and Kicking Power stats
+  · Player form condition at match time
+
+  Therefore: DO NOT judge attack on shot volume alone.
+  Calculate: Shots on Target ÷ Total Shots = Shot Quality Ratio
+
+    ≥ 0.60  → Clinical, well-constructed chances
+    0.40–0.59 → Decent but with wasted attempts
+    < 0.40  → Shooting from poor positions, likely under pressure
+             or using the wrong shot type for the situation
+
+  Flag any team with high shots but low on-target ratio as
+  likely running an aggressive/counter style without the player
+  quality to finish from range.
+
+────────────────────────────────────────────────────────────────
+RULE 2 — PASS ACCURACY REVEALS THE ATTACKING STYLE DIRECTLY
+────────────────────────────────────────────────────────────────
+
+  Calculate pass accuracy: Successful Passes ÷ Total Passes
+
+  Then map it against eFootball's attacking styles:
+
+    ≥ 88%  → Possession Game confirmed or probable
+    78–87% → Controlled build-up, likely Center Attack
+    65–77% → Transitional, Counter or Long Ball elements
+    < 65%  → Long Ball Counter, or build-up under heavy pressure
+             from opponent's Frontline Pressure / Aggressive defense
+
+  CRITICAL: If the team with LOWER pass accuracy scored MORE,
+  this is a direct indicator they are running Counter Attack
+  or Long Ball Counter successfully — punishing on transitions.
+
+────────────────────────────────────────────────────────────────
+RULE 3 — INTERCEPTIONS vs TACKLES = DEFENSIVE SHAPE SIGNATURE
+────────────────────────────────────────────────────────────────
+
+  These two stats together define the defensive strategy:
+
+    High INT, Low TKL  → Deep Defensive Line or Possession Trap
+                         Waiting, reading passing lanes, not
+                         engaging until the ball arrives.
+
+    High TKL, Low INT  → Frontline Pressure or Aggressive style.
+                         Winning ball through physical challenge,
+                         not positioning.
+
+    High INT + High TKL → Aggressive style confirmed. High risk.
+                          Check fouls — if fouls are ALSO high,
+                          the press broke down and conceded set pieces.
+
+    Low INT + Low TKL  → Either the team had the ball all match
+                         (no need to defend), or defensive shape
+                         completely collapsed (check shots conceded).
+
+────────────────────────────────────────────────────────────────
+RULE 4 — CROSSES REVEAL WIDTH INSTRUCTIONS
+────────────────────────────────────────────────────────────────
+
+  In eFootball, crosses happen when:
+  · Attacking Width slider is set high (7–10)
+  · Out Wide attacking style is active
+  · Wingers have Prolific Winger or similar wide roles
+  · The player chose to cross instead of cut inside
+
+  Crosses = 0 means one of:
+    A) Team plays narrow by design (Center Attack, low width)
+    B) Winger roles are set to cut inside (Prolific Winger)
+    C) Opponent's compact defensive shape blocked wide channels
+
+  Crosses ≥ 3 = team is actively using width as a weapon.
+  Measure: did those crosses lead to shots? If crosses are high
+  but shots are low, the delivery or striker movement failed.
+
+────────────────────────────────────────────────────────────────
+RULE 5 — SAVES ARE A GOALKEEPER WORKLOAD MEASUREMENT
+────────────────────────────────────────────────────────────────
+
+  In eFootball, goalkeepers with high GK Awareness, Reflexes,
+  and Reach stats can single-handedly alter match outcomes.
+
+  Interpret saves in context:
+
+    0 saves, 0 shots faced  → Clean sheet was never threatened.
+                              Dominant defensive performance.
+    0 saves, 1+ shots faced → Opponent missed everything.
+                              Attack was inaccurate, not defended.
+    1+ saves on 3+ shots    → Goalkeeper was decisive. Rate their
+                              performance as match-deciding.
+    Saves = Goals conceded  → Every shot that hit target went in.
+                              Either poor keeper stats or
+                              exceptional finishing from opponent.
+
+────────────────────────────────────────────────────────────────
+RULE 6 — ACCOUNT FOR THE MOMENTUM SYSTEM
+────────────────────────────────────────────────────────────────
+
+  eFootball has a known momentum shift mechanic. After a goal,
+  the opponent AI often surges — interceptions spike, passing
+  windows close, your players slow down.
+
+  When interpreting stats, flag any pattern that suggests a
+  momentum-driven stat cluster:
+  · Opponent's interceptions significantly higher than tackles
+    → May indicate an AI-driven surge period, not pure tactics
+  · Your pass accuracy dropped despite similar possession
+    → Could reflect mid-match momentum shift closing passing lanes
+  · High opponent shots in a short statistical window
+    → Classic post-goal AI surge behavior
+
+  Label these findings as: [MOMENTUM-POSSIBLE] — acknowledge
+  it without certifying, since the system is not confirmed
+  officially by Konami. Let the player decide.
+
+════════════════════════════════════════════════════════════════
+
+╔══════════════════════════════════════════════════════════════╗
+║   eFOOTBALL MOBILE — DEEP MATCH ANALYSIS ENGINE v2          ║
+║   Phase 3: Analysis Lens — What to Cover                    ║
+╚══════════════════════════════════════════════════════════════╝
+
+Analyze ALL seven dimensions. State "not determinable" only
+after active reasoning against every available stat.
+
+────────────────────────────────────────────────────────────────
+[ DIMENSION 1 — ATTACKING SYSTEM DIAGNOSIS ]
+────────────────────────────────────────────────────────────────
+
+  Identify the most likely attacking style each team ran.
+  Provide EVIDENCE from the stats — not a guess.
+
+  Then assess: was it executed well?
+  · Possession Game → Did they convert possession into shots?
+  · Counter Attack → Did they score or threaten from limited touches?
+  · Long Ball Counter → Were direct balls actually reaching targets?
+    (Low pass acc + shots = yes. Low pass acc + low shots = no)
+  · Out Wide → Did crosses lead to anything dangerous?
+  · Center Attack → Were central passing combinations creating shots?
+
+  Rate execution: SUCCESSFUL / PARTIALLY EFFECTIVE / FAILED
+
+────────────────────────────────────────────────────────────────
+[ DIMENSION 2 — DEFENSIVE STRUCTURE DIAGNOSIS ]
+────────────────────────────────────────────────────────────────
+
+  Identify the most likely defensive style each team ran.
+  Check: was the defensive line appropriate for their attack style?
+
+  CRITICAL INTERACTION IN eFOOTBALL:
+  · High Defensive Line + Aggressive Press → Effective against
+    Possession teams but DESTROYED by manual through balls
+  · Deep Defensive Line → Compact, but if opponent plays wide
+    (Out Wide style), can be exposed by driven crosses
+  · Possession Trap → Forces wide play, works if you have
+    physical wingers with strong defensive stats
+
+  Flag any dangerous combination:
+  · Aggressive defense + opponent had 3+ successful through-ball
+    indicators (shots 1v1 style, low crosses, offsides) = exploited
+  · Deep line + high opponent crosses = aerial threat not addressed
+
+────────────────────────────────────────────────────────────────
+[ DIMENSION 3 — POSSESSION QUALITY ]
+────────────────────────────────────────────────────────────────
+
+  Possession % + Pass Accuracy together = possession quality score
+
+  Map to eFootball slider context:
+  · If possession is high AND pass accuracy is high (85%+):
+    High Support Range + Possession Game = patient build-up working
+  · If possession is high BUT pass accuracy is low (under 78%):
+    Team is holding the ball under pressure — their Compactness
+    slider may be too low, leaving midfield isolated
+  · If possession is low BUT shots are equal or better:
+    Counter Attack or Long Ball Counter working as designed.
+    DO NOT penalize this team for low possession.
+
+────────────────────────────────────────────────────────────────
+[ DIMENSION 4 — PLAYER ROLE INFERENCE ]
+────────────────────────────────────────────────────────────────
+
+  From stats alone, infer what player roles were likely active:
+
+  High interceptions from one side → Anchor Man or Destroyer
+    in the midfield was doing their job
+  0 crosses but shots came from wide zones → Prolific Winger
+    (cuts inside to shoot rather than crossing)
+  Low shots despite high possession → No Goal Poacher or the
+    striker was playing Deep-Lying Forward (dropping to link play
+    rather than making box runs)
+  Very low offsides → Either no Hole Player making runs in behind,
+    or the forward role is dropping deep (Orchestrator/DLF type)
+
+  Label these as [ROLE INFERENCE] — they are educated readings,
+  not confirmed without formation/lineup data.
+
+────────────────────────────────────────────────────────────────
+[ DIMENSION 5 — SET PIECE & TRANSITION INDICATORS ]
+────────────────────────────────────────────────────────────────
+
+  Free Kicks → Reflect how many times a team was fouled, or
+    how aggressively the opponent was defending. High free kicks
+    on one side = opponent was pressing desperately, committing
+    fouls to stop transitions.
+
+  Corners → In eFootball, corners come from defensive clearances
+    under wing pressure. 0 corners for a team playing Out Wide
+    suggests the attack reached wide areas but crosses were cut
+    out cleanly before hitting the byline.
+
+  Offsides → Reveals striker behavior. If offsides are high:
+    Goal Poacher or a forward making aggressive blind-side runs.
+    Possibly the Attacking Mentality slider is too high, pushing
+    the striker to make early runs before the ball is played.
+
+────────────────────────────────────────────────────────────────
+[ DIMENSION 6 — RESULT FAIRNESS VS eFOOTBALL EFFICIENCY ]
+────────────────────────────────────────────────────────────────
+
+  Use all stats together to judge whether the scoreline was just.
+
+  Build a DOMINANCE SCORE for each team (0–10):
+  · +2 if shot on target ratio ≥ 0.60
+  · +2 if pass accuracy ≥ 80%
+  · +1 if interceptions > opponent's interceptions
+  · +1 if tackles > opponent's tackles
+  · +2 if shots on target > opponent
+  · +1 if possession > 52%
+  · +1 if crosses led to shots (crosses ≥ 1 AND shots on target ≥ 2)
+
+  Compare dominance scores. If a team scores but has a lower
+  dominance score, label them: FORTUNATE WINNER.
+  If a team loses with higher dominance: UNLUCKY LOSER.
+
+────────────────────────────────────────────────────────────────
+[ DIMENSION 7 — eFOOTBALL ANOMALY CHECK ]
+────────────────────────────────────────────────────────────────
+
+  These specific patterns suggest game engine behavior,
+  not player tactics. Flag them clearly:
+
+  · AI interceptions significantly spike relative to tackles
+    → Possible momentum system activation [MOMENTUM-POSSIBLE]
+  · Very low fouls but very high tackles
+    → AI opponent using aggressive contain + second press
+      mechanic extremely efficiently (common vs AI difficulty)
+  · Shots on target for one team = 0 despite 3+ total shots
+    → Shots being taken from poor body positions under pressure;
+      suggests player instruction to shoot early is active
+  · Saves = 0 on 1+ shots
+    → Either GK stats were very high, or shots were off target
+      (covered in shots on target stat — verify consistency)
+
+════════════════════════════════════════════════════════════════
+
+────────────────────────────────────────────────────────────────
+[ DIMENSION 8 — TREND ANALYSIS & FORM TRAJECTORY ]
+────────────────────────────────────────────────────────────────
+
+  A TREND ANALYSIS block is provided above the match tables.
+  This is pre-calculated trajectory data — READ IT CAREFULLY.
+
+  Use it to answer:
+  · Is this opponent getting BETTER or WORSE as the season progresses?
+  · Is their pass accuracy rising (improving build-up) or falling?
+  · Is their shot quality improving (more clinical) or declining?
+  · Are they on a hot streak or cold streak — and what does that mean
+    psychologically for how they will approach this match?
+
+  CRITICAL RULE — Trending data overrides flat averages:
+  · If their pass accuracy average is 75% but the trend shows
+    ↑ IMPROVING from 70% → 82%, treat them as an 82% pass accuracy
+    team in current form — the average understates the real threat.
+  · If their shot quality is ↓ DECLINING, their attack is becoming
+    less efficient — their average may overstate the real threat.
+
+  Label trend-based findings as [TREND-CONFIRMED] when the
+  trajectory supports the conclusion across 2+ matches.
+  Label as [SINGLE-MATCH — VERIFY] if only one data point shifts.
+
+  Connect form streak to psychology:
+  · HOT STREAK → Expect high-pressing, confident, risk-taking play
+  · COLD STREAK → Expect conservative, possibly desperate — exploit
+    by staying patient and drawing them out of shape
+
+════════════════════════════════════════════════════════════════
+
+╔══════════════════════════════════════════════════════════════╗
+║   eFOOTBALL MOBILE — DEEP MATCH ANALYSIS ENGINE v2          ║
+║   Phase 4: Report Structure                                 ║
+╚══════════════════════════════════════════════════════════════╝
+
+Produce your analysis using EXACTLY this eight-section structure.
+Do not reorder, merge, or skip any section.
+
+────────────────────────────────────────────────────────────────
+SECTION 1 — MATCH SNAPSHOT  (2–3 sentences)
+────────────────────────────────────────────────────────────────
+  A sharp summary of the match's character. Name the dominant
+  style you inferred for each team. Capture whether the result
+  was earned or stolen.
+
+────────────────────────────────────────────────────────────────
+SECTION 2 — STAT-BY-STAT BREAKDOWN
+────────────────────────────────────────────────────────────────
+  For every stat provided, give:
+  · The raw numbers
+  · What they reveal in eFootball mechanical context
+  · Which team this stat favors and why
+  Include calculated ratios: pass accuracy %, shot quality %.
+
+────────────────────────────────────────────────────────────────
+SECTION 3 — ATTACKING SYSTEM VERDICT
+────────────────────────────────────────────────────────────────
+  For each team:
+  · Inferred attacking style (with stat evidence)
+  · Execution rating: SURGICAL / EFFICIENT / WASTEFUL / TOOTHLESS
+  · What the attack did well and where it broke down
+
+────────────────────────────────────────────────────────────────
+SECTION 4 — DEFENSIVE SYSTEM VERDICT
+────────────────────────────────────────────────────────────────
+  For each team:
+  · Inferred defensive style (with stat evidence)
+  · Defense rating: FORTRESS / DISCIPLINED / LEAKY / EXPOSED
+  · Any dangerous matchup between their defense and the
+    opponent's attacking style — flag exploitation risks
+
+────────────────────────────────────────────────────────────────
+SECTION 5 — POSSESSION QUALITY ASSESSMENT
+────────────────────────────────────────────────────────────────
+  · Pass accuracy for both teams (calculated)
+  · Whether possession was productive or sterile
+  · How the Support Range and Compactness sliders likely
+    contributed to the passing picture
+
+────────────────────────────────────────────────────────────────
+SECTION 6 — DOMINANCE SCORE & RESULT FAIRNESS
+────────────────────────────────────────────────────────────────
+  Show the Dominance Score calculation for both teams.
+  Deliver one of these verdicts:
+    RESULT REFLECTS PLAY
+    RESULT SLIGHTLY FLATTERS [Team]
+    RESULT GREATLY FLATTERS [Team] — UNLUCKY LOSER DETECTED
+  Justify with specific stat references.
+
+────────────────────────────────────────────────────────────────
+SECTION 7 — KEY TACTICAL INSIGHTS  (4–6 bullet points)
+────────────────────────────────────────────────────────────────
+  The most important strategic observations.
+  Each point must reference a specific stat AND a specific
+  eFootball mechanic (style, slider, player role, or system).
+
+────────────────────────────────────────────────────────────────
+SECTION 8 — TREND VERDICT & FORM READING
+────────────────────────────────────────────────────────────────
+  Using the TREND ANALYSIS block provided:
+  · State whether the opponent is improving, declining, or stable
+    across each key metric — reference specific trajectory numbers
+  · Give a FORM RATING: PEAK FORM / GOOD FORM / INCONSISTENT / OUT OF FORM
+  · Name the 2 biggest trend risks: what is this opponent getting
+    better at that the requesting player must counter?
+  · Name 1 exploit: what is declining that can be targeted?
+
+────────────────────────────────────────────────────────────────
+SECTION 9 — WHAT TO ADJUST  (For the player's team)
+────────────────────────────────────────────────────────────────
+  Concrete eFootball-specific adjustments tied to real settings:
+
+  FORMAT each adjustment as:
+    PROBLEM   → [what the stats revealed]
+    CAUSE     → [likely eFootball setting or role contributing]
+    FIX       → [exact setting change: style, slider value,
+                 formation tweak, or player role adjustment]
+
+  Minimum 3 adjustments. Maximum 6. No generic football advice.
+  Every fix must be something you can literally change inside
+  eFootball Mobile's team management screen.
+
+════════════════════════════════════════════════════════════════
+
+╔══════════════════════════════════════════════════════════════╗
+║   eFOOTBALL MOBILE — DEEP MATCH ANALYSIS ENGINE v2          ║
+║   Phase 5: Evidence Standards & Final Instruction           ║
+╚══════════════════════════════════════════════════════════════╝
+
+────────────────────────────────────────────────────────────────
+BEFORE STATING ANY FINDING, VERIFY ALL OF THE FOLLOWING:
+────────────────────────────────────────────────────────────────
+
+  ✓ You used the actual stat number provided — not assumed it
+  ✓ You cross-referenced it with at least one related stat
+  ✓ You considered whether the pattern could be mechanical
+    (momentum system) vs tactical (player instruction)
+  ✓ You calculated the relevant ratio (pass acc, shot quality)
+  ✓ You connected the finding to an eFootball mechanic by name
+  ✓ You distinguished between what is DEFINITIVE and INFERRED
+
+────────────────────────────────────────────────────────────────
+UNCERTAINTY LABELING SYSTEM
+────────────────────────────────────────────────────────────────
+
+  Use these labels when certainty cannot be confirmed from stats:
+
+  [INFERRED]          — Reasonable tactical conclusion, but would
+                        need lineup/formation data to confirm
+  [MOMENTUM-POSSIBLE] — Pattern matches eFootball's momentum
+                        system behavior; cannot confirm without
+                        live match footage
+  [REQUIRES CONTEXT]  — Finding depends on information not
+                        present in the stat line (e.g., player
+                        form conditions, specific player roles)
+
+────────────────────────────────────────────────────────────────
+TONE STANDARDS
+────────────────────────────────────────────────────────────────
+
+  · Write as a sharp eFootball analyst, not a commentator
+  · Use eFootball vocabulary: pressing triggers, defensive line,
+    attacking width, support range, player roles by name
+  · Every sentence must carry mechanical meaning — no filler
+  · Be direct about which team played better and why
+  · Do not celebrate the winner automatically — if they were
+    fortunate, say so with evidence
+
+────────────────────────────────────────────────────────────────
+FINAL INSTRUCTION
+────────────────────────────────────────────────────────────────
+
+  Work through all phases in order.
+  The most revealing findings are often in the LOSING team's
+  stats — a team can statistically outplay their opponent and
+  still lose due to poor shot conversion or momentum shifts.
+  Find that story if it exists. Name it directly.
+
+  Do not produce a partial report.
+  Do not stop at the obvious surface observations.
+
+════════════════════════════════════════════════════════════════
+  [PASTE YOUR eFOOTBALL MATCH STATISTICS BELOW THIS LINE]
+════════════════════════════════════════════════════════════════
+
+  My Team: ___________________   Score: ___ – ___
+  Opponent: __________________
+
+  Stat                | My Team | Opponent
+  --------------------|---------|----------
+  Possession          |         |
+  Shots               |         |
+  Shots on Target     |         |
+  Fouls               |         |
+  Offsides            |         |
+  Corner Kicks        |         |
+  Free Kicks          |         |
+  Passes              |         |
+  Successful Passes   |         |
+  Crosses             |         |
+  Interceptions       |         |
+  Tackles             |         |
+  Saves               |         |
+
+  [OPTIONAL — helps improve analysis accuracy]
+  My Attacking Style  : ___________________________
+  My Defensive Style  : ___________________________
+  My Formation        : ___________________________
+
+════════════════════════════════════════════════════════════════`;
+
+    // ── Tactical Upgrade Engine v2 (Sub-Prompt) ──────────────────────────────
+    const UPGRADE_ENGINE_V2 = `╔══════════════════════════════════════════════════════════════╗
+║   eFOOTBALL MOBILE — TACTICAL UPGRADE ENGINE                ║
+║   Sub-Prompt: Convert Analysis Into Actionable Fixes        ║
+╚══════════════════════════════════════════════════════════════╝
+
+You have completed the match analysis above.
+Now activate the Tactical Upgrade Engine.
+
+Your task: take every weakness, inefficiency, and finding from
+the analysis and convert it into a PRECISE improvement plan
+that maps directly to eFootball Mobile's adjustable settings.
+
+────────────────────────────────────────────────────────────────
+CORE PRINCIPLE
+────────────────────────────────────────────────────────────────
+
+  Every recommendation MUST reference a real eFootball setting:
+  · An Attacking Style (Possession Game, Counter, Long Ball,
+    Out Wide, Center Attack)
+  · A Defensive Style (Deep Line, Frontline Pressure,
+    Aggressive, Possession Trap)
+  · A Slider (Attacking Width, Defensive Line, Compactness,
+    Support Range — suggest a target value 1–10)
+  · A Player Role (Goal Poacher, Prolific Winger, Anchor Man,
+    Destroyer, Hole Player, Box-to-Box, Orchestrator, etc.)
+  · A Formation Change (e.g., 4-3-3 → 4-2-3-1 to add midfield
+    screen, or asymmetric attack/defend formation)
+  · A Player Instruction (individual player role swap or
+    out-of-position flag check)
+
+  Recommendations not tied to an actual eFootball setting
+  are INVALID and must be discarded.
+
+────────────────────────────────────────────────────────────────
+FIX CATEGORIES — ADDRESS EACH APPLICABLE ONE
+────────────────────────────────────────────────────────────────
+
+  [ A ] ATTACKING STYLE ALIGNMENT
+  ─────────────────────────────────
+  Was the team's attacking style suited to their stats?
+  · If pass accuracy was too low for Possession Game → recommend
+    switching to Center Attack or Counter Attack
+  · If crosses led to nothing → recommend shifting from Out Wide
+    to Center Attack, OR increasing striker's aerial stats
+  · If shots were wasteful → recommend style switch that creates
+    higher quality positions (Possession Game for better angles)
+
+  [ B ] DEFENSIVE STYLE ALIGNMENT
+  ─────────────────────────────────
+  Was the defensive style creating or hiding vulnerabilities?
+  · If interceptions were low and shots conceded were high
+    → consider shifting from Aggressive to Frontline Pressure
+    or Deep Defensive Line depending on opponent's attack pattern
+  · If the opponent ran Counter Attack successfully
+    → recommend lowering Attacking Width slider (reduce exposure)
+    and switching to Deep Defensive Line when leading
+
+  [ C ] SLIDER ADJUSTMENTS
+  ─────────────────────────────────
+  Recommend specific slider values for next match based on:
+
+    ATTACKING WIDTH
+    · Was play too narrow? → Increase to 7–8
+    · Was the team exposed on counters? → Decrease to 4–5
+
+    DEFENSIVE LINE
+    · Were through balls getting through? → Lower to 4–5
+    · Was compactness breaking too easily? → Lower to 3–4
+    · Need to press high and win ball quickly? → Raise to 7–8
+
+    COMPACTNESS
+    · Was midfield too easily bypassed? → Increase to 7–8
+    · Are transitions slow because players are too bunched? → 5–6
+
+    SUPPORT RANGE
+    · Striker isolated from midfield support? → Increase to 6–7
+    · Build-up was fine but final third lacked movement? → 7–8
+
+  [ D ] PLAYER ROLE ADJUSTMENTS
+  ─────────────────────────────────
+  From the stat inference in the analysis, identify role mismatches:
+
+  · No shots from wide = switch Prolific Winger role to confirm
+    it's set for cut-inside behavior, not crossing
+  · No runs in behind = add a Goal Poacher or set a Hole Player
+    to make late runs into the box
+  · Midfield overrun = verify Anchor Man is present and not
+    replaced by two offensive midfielders
+  · Link-up play failing = consider a Deep-Lying Forward or
+    Orchestrator to drop and create passing triangles
+
+  [ E ] FORMATION RESPONSE
+  ─────────────────────────────────
+  Based on how the opponent attacked, recommend a formation tweak:
+
+  · Against heavy crossing (high opponent crosses):
+    → 5-3-2 or 4-5-1 to pack the wide channels
+  · Against Counter Attack opponent (you had more possession
+    but they threatened on transitions):
+    → 4-2-3-1 with two defensive mids to screen
+  · Against Central Attack opponent (everything came through middle):
+    → Tighter compactness slider + Destroyer role in midfield
+
+  [ F ] IN-MATCH MANAGEMENT PROTOCOL
+  ─────────────────────────────────
+  Based on the match script, suggest when adjustments should be
+  made DURING the game (not just at setup):
+
+  · If you score first → When to switch to Deep Defensive Line
+    and drop Defensive Line slider to protect the lead
+  · If you go behind → When to push Attacking Width slider up
+    and switch to Possession Game to maintain control
+  · If momentum shifts detected → Suggest a sub + formation
+    tweak timed to reset the game state
+
+  [ G ] PLAYER CONDITION PRIORITY
+  ─────────────────────────────────
+  Remind the player:
+  · Player form arrows (gold/green/yellow/red) apply a hidden
+    stat multiplier — a red-form Finishing player will miss
+    shots a gold-form player converts
+  · For the next match, prioritize starting players currently
+    showing gold or green condition arrows in key positions:
+    Striker (Finishing), Central Mid (Vision/Low Pass),
+    Goalkeeper (Reflexes/GK Awareness)
+
+────────────────────────────────────────────────────────────────
+OUTPUT FORMAT FOR SUB-PROMPT
+────────────────────────────────────────────────────────────────
+
+  Produce the improvement plan in this format:
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  TACTICAL UPGRADE PLAN — [Match Result]                 │
+  └─────────────────────────────────────────────────────────┘
+
+  PRIORITY FIXES (Address before next match):
+  ① [Most critical fix — style/slider/role + exact value]
+  ② [Second fix]
+  ③ [Third fix]
+
+  SECONDARY ADJUSTMENTS (For fine-tuning):
+  · [Adjustment 1]
+  · [Adjustment 2]
+
+  IN-MATCH TRIGGERS:
+  · If [situation] → [specific adjustment]
+  · If [situation] → [specific adjustment]
+
+  CONDITION CHECK REMINDER:
+  · [Position] — start only on gold/green form next match
+  · [Position] — bench if on yellow/red form
+
+  ────────────────────────────────────────────────────────
+  Keep every recommendation specific, mechanical, and
+  grounded in what eFootball Mobile actually allows you
+  to change. No generic advice. No vague suggestions.
+  ────────────────────────────────────────────────────────`;
+
+    // ── Build prompt blocks ─────────────────────────────────────────────────
+    // Block 4: Requesting player context
+    // ── Build stats table for each opponent match ─────────────────────────
+    const fmtN = v => (v !== null && v !== undefined) ? v : '—';
+
+    // Build the stats table rows — one table per match, injected at Phase 5 slot
+    let matchTables = '';
+    oppMatches.forEach((m, idx) => {
+      const s   = m.stats   || {};
+      const ctx = m.context || {};
+      const passAcc = (s.passes && s.successfulPasses)
+        ? Math.round((s.successfulPasses / s.passes) * 100) + '%'
+        : '—';
+      const shotQual = (s.shots && s.shotsOnTarget)
+        ? Math.round((s.shotsOnTarget / s.shots) * 100) + '%'
+        : '—';
+
+      // INTEL-05 FIX: pull opponent-side stats from oppSideStatsMap (fetched above)
+      const os = oppSideStatsMap[m.fixtureId] || {};
+      const oppPassAcc = (os.passes && os.successfulPasses)
+        ? Math.round((os.successfulPasses / os.passes) * 100) + '%'
+        : '—';
+      const oppShotQual = (os.shots && os.shotsOnTarget)
+        ? Math.round((os.shotsOnTarget / os.shots) * 100) + '%'
+        : '—';
+
+      matchTables += `
+────────────────────────────────────────────────────────────────
+MATCH ${idx+1} OF ${matchesAnalysed} — Match Day ${m.matchDay||'?'} — Result: ${m.result||'?'} (${m.goalsFor||0}–${m.goalsAgainst||0})
+────────────────────────────────────────────────────────────────
+
+  My Team: ${oppPlayer.clubName}   Score: ${m.goalsFor||0} – ${m.goalsAgainst||0}   Opponent: [opponent]
+
+  Stat                | My Team  | Opponent
+  --------------------|----------|----------
+  Possession          | ${fmtN(s.possession)}%     | ${fmtN(100-(s.possession||0))}%
+  Shots               | ${fmtN(s.shots)}        | ${fmtN(os.shots)}
+  Shots on Target     | ${fmtN(s.shotsOnTarget)}        | ${fmtN(os.shotsOnTarget)}
+  Fouls               | ${fmtN(s.fouls)}        | ${fmtN(os.fouls)}
+  Offsides            | ${fmtN(s.offsides)}        | ${fmtN(os.offsides)}
+  Corner Kicks        | ${fmtN(s.cornerKicks)}        | ${fmtN(os.cornerKicks)}
+  Free Kicks          | ${fmtN(s.freeKicks)}        | ${fmtN(os.freeKicks)}
+  Passes              | ${fmtN(s.passes)}        | ${fmtN(os.passes)}
+  Successful Passes   | ${fmtN(s.successfulPasses)}        | ${fmtN(os.successfulPasses)}
+  Crosses             | ${fmtN(s.crosses)}        | ${fmtN(os.crosses)}
+  Interceptions       | ${fmtN(s.interceptions)}        | ${fmtN(os.interceptions)}
+  Tackles             | ${fmtN(s.tackles)}        | ${fmtN(os.tackles)}
+  Saves               | ${fmtN(s.saves)}        | ${fmtN(os.saves)}
+
+  Calculated:
+  Pass Accuracy       : ${passAcc}        | ${oppPassAcc}
+  Shot Quality Ratio  : ${shotQual}        | ${oppShotQual}
+
+  [OPTIONAL — context supplied by player]
+  My Attacking Style  : ${ctx.attackDirection === 'wings' ? 'Out Wide (wings)' : ctx.attackDirection === 'middle' ? 'Center Attack (middle)' : 'unknown'}
+  My Formation        : ${ctx.formation || 'unknown'}
+  Opponent pressing   : ${ctx.opponentPressing === true ? 'yes — Frontline Pressure or Aggressive likely' : ctx.opponentPressing === false ? 'no' : 'unknown'}
+  Opponent sat back   : ${ctx.opponentDefensive === true ? 'yes — Deep Defensive Line or Possession Trap likely' : ctx.opponentDefensive === false ? 'no' : 'unknown'}
+  Scored first        : ${ctx.scoredFirst === true ? 'yes' : ctx.scoredFirst === false ? 'no' : 'unknown'}
+  Out of position     : ${ctx.outOfPositionPlayers === true ? 'yes' : ctx.outOfPositionPlayers === false ? 'no' : 'unknown'}
+  Set piece goal      : ${ctx.setpieceGoal === true ? 'yes' : ctx.setpieceGoal === false ? 'no' : 'unknown'}
+  Momentum shift felt : ${ctx.momentumShift === true ? 'yes [MOMENTUM-POSSIBLE elevated to CONFIRMED]' : ctx.momentumShift === false ? 'no' : 'unknown'}
+  Made substitutions  : ${ctx.madeSubstitutions === true ? 'yes' : ctx.madeSubstitutions === false ? 'no' : 'unknown'}
+  Self-mistake goal   : ${ctx.selfMistakeGoal === true ? 'yes' : ctx.selfMistakeGoal === false ? 'no' : 'unknown'}
+`;
+    });
+
+    // ── Section 9 personalisation anchor (Section 8 = Trend Verdict) ──────────
+    const section8Anchor = `════════════════════════════════════════════════════════════════
+PLAYER TIER & CONTEXT — READ BEFORE WRITING ANY SECTION
+════════════════════════════════════════════════════════════════
+
+REQUESTING PLAYER  : ${reqPlayer.clubName} (${reqPlayer.gameName})
+  Tier             : ${reqTierLabel}
+  Formation        : ${myFormation}
+  Attack style     : ${myAttackDir}
+  Avg pass accuracy: ${myAvgPassAcc !== null ? myAvgPassAcc+'%' : 'N/A'}
+  Avg shots/match  : ${myAvgShots !== null ? myAvgShots : 'N/A'}
+
+OPPONENT SCOUTED   : ${oppPlayer.clubName}
+  Tier             : ${oppTierLabel}
+
+FIXTURE MATCHUP    : ${tierMatchup}
+
+TIER-BASED ANALYSIS RULES:
+- UNDERDOG vs ELITE: Do NOT give generic advice. The underdog needs realistic
+  upset paths — which specific weaknesses in the elite player's stats can be
+  exploited? What low-risk setup limits the elite player's strengths?
+  Frame the analysis as: "Here is how you compete, not just how you survive."
+- ELITE vs UNDERDOG: Warn against complacency. Flag if the underdog has any
+  improving trends that make them more dangerous than their tier suggests.
+- EVEN MATCHUP: Emphasise fine margins — the difference will come from
+  tactical adjustments, not raw ability. Identify the 1-2 stats that will
+  be decisive.
+- UNCLASSIFIED: Base analysis purely on match data available. Do not reference
+  tier labels if data is insufficient.
+
+SECTION 9 "WHAT TO ADJUST" must be written for the REQUESTING PLAYER.
+Write as: "Here is what ${reqPlayer.clubName} should do to beat ${oppPlayer.clubName}."
+Every PROBLEM / CAUSE / FIX must be from ${reqPlayer.clubName}'s perspective.
+════════════════════════════════════════════════════════════════`;
+
+    // ── CALL 1: Full prompt — engine first, stats at Phase 5 slot ────────────
+    // The engine ends with the [PASTE] marker — we inject the stats right there.
+    const fullPrompt = ANALYSIS_ENGINE_V2.replace(
+      '[PASTE YOUR eFOOTBALL MATCH STATISTICS BELOW THIS LINE]',
+      `[CEE SCOUTING MODE — AUTOMATED STAT INJECTION]
+
+You are performing a CROSS-MATCH SCOUTING ANALYSIS.
+You are NOT analysing your own match. You are scouting: ${oppPlayer.clubName}
+This report will be read by: ${reqPlayer.clubName}
+
+The stats below are ${oppPlayer.clubName}'s verified match records — ${matchesAnalysed} match(es) this season.
+In each table, "My Team" = ${oppPlayer.clubName}.
+
+For patterns appearing in 2+ matches: treat as CONFIRMED TENDENCY.
+For patterns appearing in only 1 match: label [SINGLE-MATCH — VERIFY].
+
+${section8Anchor}
+
+${TREND_REPORT}
+
+${matchTables}
+════════════════════════════════════════════════════════════════`
+    );
+
+    // ── CALL 2: Upgrade Engine — engine first, analysis injected at output slot
+    const upgradeSubPrompt = UPGRADE_ENGINE_V2.replace(
+      'TACTICAL UPGRADE PLAN — [Match Result]',
+      `TACTICAL UPGRADE PLAN — ${reqPlayer.clubName} vs ${oppPlayer.clubName}`
+    ) + `
+
+════════════════════════════════════════════════════════════════
+MATCH ANALYSIS TO USE AS EVIDENCE BASE:
+════════════════════════════════════════════════════════════════
+Requesting player : ${reqPlayer.clubName} | Formation: ${myFormation} | Attack: ${myAttackDir} | Avg pass acc: ${myAvgPassAcc !== null ? myAvgPassAcc+'%' : 'N/A'}
+Opponent scouted  : ${oppPlayer.clubName} | Matches analysed: ${matchesAnalysed}
+
+Every fix in the upgrade plan must be actionable for ${reqPlayer.clubName} specifically.
+`;
+
+    // ── Call 1 — Main Analysis ──────────────────────────────────────────────
+    let reportText = '', upgradeText = '';
+    try {
+      const _gr1 = await _geminiPost({
+          contents: [{ parts: [{ text: fullPrompt }] }],
+          generationConfig: { maxOutputTokens: 4000, temperature: 0 }
+        });
+      if (!_gr1.ok) throw new Error(_gr1.error || 'Gemini Call 1 failed');
+      reportText = (_gr1.data.candidates&&_gr1.data.candidates[0]&&_gr1.data.candidates[0].content&&_gr1.data.candidates[0].content.parts&&_gr1.data.candidates[0].content.parts[0]&&_gr1.data.candidates[0].content.parts[0].text) || '';
+      if (!reportText) throw new Error('Gemini Call 1 returned empty response');
+    } catch(e1) {
+      console.error('[CEE] analyzeOpponent Call 1 error:', e1.message);
+      // If cached report exists, serve as fallback
+      if (cachedReport && cachedReport.reportText) {
+        return res.json({ success: false, reason: 'ai_unavailable', message: 'Analysis engine temporarily unavailable. Your cached report has been returned.', reportText: cachedReport.reportText, upgradeText: cachedReport.upgradeText || '', cached: true });
+      }
+      return res.json({ success: false, reason: 'ai_unavailable', message: 'Analysis engine is temporarily unavailable. Please try again shortly.' });
+    }
+
+    // ── Call 2 — Tactical Upgrade Engine ────────────────────────────────────
+    try {
+      const _gr2 = await _geminiPost({
+          contents: [{ parts: [{ text: upgradeSubPrompt + reportText }] }],
+          generationConfig: { maxOutputTokens: 2500, temperature: 0 }
+        });
+      if (_gr2.ok) {
+        upgradeText = (_gr2.data.candidates&&_gr2.data.candidates[0]&&_gr2.data.candidates[0].content&&_gr2.data.candidates[0].content.parts&&_gr2.data.candidates[0].content.parts[0]&&_gr2.data.candidates[0].content.parts[0].text) || '';
+      }
+    } catch(e2) {
+      console.error('[CEE] analyzeOpponent Call 2 error:', e2.message);
+      upgradeText = ''; // Non-fatal — report is still returned without upgrade plan
+    }
+
+    // ── Cache the report ────────────────────────────────────────────────────
+    const reportDoc = {
+      requestingPlayerId, opponentPlayerId, seasonId,
+      generatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      opponentLastMatchId: latestOppMatch._id,
+      reportText,
+      upgradeText,
+      matchesAnalysed,
+      opponentName: oppPlayer.clubName || oppPlayer.gameName || 'Unknown'
+    };
+    await db.collection('scoutReports').doc(reportDocId).set(reportDoc);
+
+    // Update intelligence stats in config
+    db.collection('config').doc('intelligence').set({
+      lastGeminiCallAt: admin.firestore.FieldValue.serverTimestamp(),
+      reportsGeneratedTotal: admin.firestore.FieldValue.increment(1)
+    }, { merge: true }).catch(() => {});
+
+    console.log(`[CEE] Scout report generated: ${reqPlayer.clubName} scouting ${oppPlayer.clubName} (${matchesAnalysed} matches analysed)`);
 
     return res.json({
-      success: true, verdict, confidence: conf, passCount, totalClues: 6,
-      clues, ai, homeIdentifiersUsed: hId, awayIdentifiersUsed: aId,
-      note: 'Admin test tool — results not saved to Firestore'
+      success: true,
+      cached: false,
+      reportText,
+      upgradeText,
+      matchesAnalysed,
+      opponentName: oppPlayer.clubName || oppPlayer.gameName,
+      generatedAt: new Date().toISOString()
     });
+
   } catch(e) {
-    console.error('[CEE] adminVerifyScreenshot error:', e.message);
-    return res.json({ success: false, message: e.message });
+    console.error('[CEE] analyzeOpponent error:', e.message);
+    return res.status(500).json({ success: false, message: 'Server error: ' + e.message });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ADMIN: LEGACY TEST AI VERIFIER (kept for backwards compat)
 // ═══════════════════════════════════════════════════════════════════════════
+// GET /getMatchProbabilities — Match Probability Engine
+// Calculates win probability for every fixture where both players have 4+
+// verified matches. Returns probabilities for all fixtures in a season,
+// or a single fixture if fixtureId is provided.
+//
+// Formula (weighted Elo-style):
+//   Base:        PR rating gap            (40% weight)
+//   Form:        Last 3 match results     (25% weight)
+//   H2H:         Head-to-head record      (20% weight)
+//   Efficiency:  Shot accuracy delta      (10% weight)
+//   Defense:     Goals conceded delta     ( 5% weight)
+//
+// Output: winProbA (0–100), winProbB (0–100), drawProb (0–100), confidence
+// Probabilities only shown when BOTH players have 4+ verified matches.
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/getMatchProbabilities', async (req, res) => {
+  const { seasonId, fixtureId } = req.query;
+  const sid = seasonId || await getSeasonId();
+  if (!sid) return res.status(400).json({ success: false, message: 'seasonId required' });
+
+  try {
+    // ── Fetch all matchStats for this season ──────────────────────────────
+    const allMatchSnap = await db.collection('matchStats')
+      .where('seasonId', '==', sid)
+      .get();
+
+    const playerMatchMap = {}; // playerId → [matchStat docs]
+    allMatchSnap.forEach(doc => {
+      const d = doc.data();
+      if (!playerMatchMap[d.playerId]) playerMatchMap[d.playerId] = [];
+      playerMatchMap[d.playerId].push(d);
+    });
+
+    // ── Fetch all players for PR/tier data ────────────────────────────────
+    const playersSnap = await db.collection('players').get();
+    const playerMap = {};
+    playersSnap.forEach(doc => { playerMap[doc.id] = { id: doc.id, ...doc.data() }; });
+
+    // ── Fetch fixtures ────────────────────────────────────────────────────
+    let fixturesSnap;
+    if (fixtureId) {
+      const fd = await db.collection('fixtures').doc(fixtureId).get();
+      fixturesSnap = fd.exists ? [fd] : [];
+    } else {
+      const fSnap = await db.collection('fixtures')
+        .where('seasonId', '==', sid)
+        .where('phase', '==', 'league')
+        .get();
+      fixturesSnap = fSnap.docs;
+    }
+
+    // ── Helper: calculate win probability for a pair ──────────────────────
+    function _calcProbability(pidA, pidB) {
+      const matchesA = playerMatchMap[pidA] || [];
+      const matchesB = playerMatchMap[pidB] || [];
+
+      // Need 4+ matches each
+      if (matchesA.length < 4 || matchesB.length < 4) {
+        return { sufficient: false, reason: matchesA.length < 4 ? `${playerMap[pidA]?.clubName || pidA} needs ${4 - matchesA.length} more match(es)` : `${playerMap[pidB]?.clubName || pidB} needs ${4 - matchesB.length} more match(es)` };
+      }
+
+      const pA = playerMap[pidA] || {};
+      const pB = playerMap[pidB] || {};
+
+      // ── COMPONENT 1: PR Rating gap (40%) ─────────────────────────────────
+      const prA = pA.performanceRating != null ? pA.performanceRating : 50;
+      const prB = pB.performanceRating != null ? pB.performanceRating : 50;
+      const prDiff = prA - prB; // positive = A stronger
+      // Convert PR diff to probability using logistic curve
+      // PR diff of 30 = ~80% win chance for stronger player
+      const prProbA = 1 / (1 + Math.pow(10, -prDiff / 30));
+
+      // ── COMPONENT 2: Recent form — last 3 matches (25%) ──────────────────
+      const recentA = matchesA.slice(-3);
+      const recentB = matchesB.slice(-3);
+      const formScoreA = recentA.reduce((acc, m) => acc + (m.result === 'W' ? 1 : m.result === 'D' ? 0.4 : 0), 0) / recentA.length;
+      const formScoreB = recentB.reduce((acc, m) => acc + (m.result === 'W' ? 1 : m.result === 'D' ? 0.4 : 0), 0) / recentB.length;
+      const formTotal  = formScoreA + formScoreB;
+      const formProbA  = formTotal > 0 ? formScoreA / formTotal : 0.5;
+
+      // ── COMPONENT 3: Head-to-head record (20%) ───────────────────────────
+      // Check all matchStats where playerId=A and opponentId=B or vice versa
+      const h2hMatchesA = matchesA.filter(m => m.opponentId === pidB);
+      const h2hMatchesB = matchesB.filter(m => m.opponentId === pidA);
+      let h2hProbA = 0.5; // default: no H2H data
+      if (h2hMatchesA.length > 0 || h2hMatchesB.length > 0) {
+        const h2hWinsA = h2hMatchesA.filter(m => m.result === 'W').length;
+        const h2hWinsB = h2hMatchesB.filter(m => m.result === 'W').length;
+        const h2hTotal = h2hWinsA + h2hWinsB;
+        if (h2hTotal > 0) h2hProbA = h2hWinsA / h2hTotal;
+      }
+      const h2hWeight = (h2hMatchesA.length + h2hMatchesB.length) > 0 ? 0.20 : 0; // skip if no H2H
+      const prWeightAdj  = h2hWeight === 0 ? 0.50 : 0.40; // redistribute H2H weight to PR if no H2H
+      const formWeightAdj = h2hWeight === 0 ? 0.30 : 0.25;
+
+      // ── COMPONENT 4: Shot efficiency delta (10%) ─────────────────────────
+      const _shotAcc = matches => {
+        const vals = matches.map(m => m.stats && m.stats.shots > 0 && m.stats.shotsOnTarget != null
+          ? m.stats.shotsOnTarget / m.stats.shots : null).filter(v => v !== null);
+        return vals.length ? vals.reduce((a,b) => a+b,0) / vals.length : 0.5;
+      };
+      const shotAccA = _shotAcc(matchesA);
+      const shotAccB = _shotAcc(matchesB);
+      const shotTotal = shotAccA + shotAccB;
+      const shotProbA = shotTotal > 0 ? shotAccA / shotTotal : 0.5;
+
+      // ── COMPONENT 5: Defensive record delta (5%) ─────────────────────────
+      const _gaPerMatch = matches => {
+        const vals = matches.map(m => m.goalsAgainst != null ? m.goalsAgainst : null).filter(v => v !== null);
+        return vals.length ? vals.reduce((a,b) => a+b,0) / vals.length : 1.5;
+      };
+      const gaA = _gaPerMatch(matchesA); // lower = better
+      const gaB = _gaPerMatch(matchesB);
+      // Invert: lower conceded = higher probability
+      const defProbA = gaA < gaB ? 0.65 : gaA > gaB ? 0.35 : 0.5;
+
+      // ── Weighted combination ──────────────────────────────────────────────
+      const rawProbA = (
+        prProbA   * prWeightAdj   +
+        formProbA * formWeightAdj +
+        h2hProbA  * h2hWeight     +
+        shotProbA * 0.10          +
+        defProbA  * 0.05
+      );
+
+      // ── Draw probability — higher when teams are closely matched ──────────
+      const closeness = 1 - Math.abs(rawProbA - 0.5) * 2; // 1 = 50/50, 0 = complete mismatch
+      const drawProb  = Math.round(closeness * 22); // max ~22% draw probability (eFootball is low scoring)
+      const winProbARaw = Math.round(rawProbA * (100 - drawProb));
+      const winProbBRaw = 100 - drawProb - winProbARaw;
+
+      // Clamp to sensible range (minimum 5% for any outcome)
+      const winProbA = Math.max(5, Math.min(90, winProbARaw));
+      const winProbB = Math.max(5, Math.min(90, winProbBRaw));
+      const drawProbFinal = 100 - winProbA - winProbB;
+
+      // Confidence: higher when more matches available and H2H exists
+      const avgMatches = (matchesA.length + matchesB.length) / 2;
+      const confidence = Math.min(100, Math.round(
+        (Math.min(avgMatches, 10) / 10) * 70 +
+        (h2hMatchesA.length > 0 ? 20 : 0) +
+        10
+      ));
+
+      // Narrative label
+      let narrative = '';
+      if (winProbA >= 70)      narrative = `${pA.clubName || pidA} are strong favourites`;
+      else if (winProbA >= 58) narrative = `${pA.clubName || pidA} have the edge`;
+      else if (winProbA >= 48) narrative = 'Evenly matched — could go either way';
+      else if (winProbB >= 58) narrative = `${pB.clubName || pidB} have the edge`;
+      else                     narrative = `${pB.clubName || pidB} are strong favourites`;
+
+      return {
+        sufficient: true,
+        winProbA, winProbB, drawProb: drawProbFinal,
+        confidence,
+        narrative,
+        prA, prB,
+        tierA: pA.playerTier || null,
+        tierB: pB.playerTier || null,
+        formA: recentA.map(m => m.result).join(''),
+        formB: recentB.map(m => m.result).join(''),
+        h2hRecord: h2hMatchesA.length > 0 ? `${h2hMatchesA.filter(m=>m.result==='W').length}W-${h2hMatchesA.filter(m=>m.result==='D').length}D-${h2hMatchesA.filter(m=>m.result==='L').length}L` : 'No H2H'
+      };
+    }
+
+    // ── Calculate for all fixtures ────────────────────────────────────────
+    const results = [];
+    for (const doc of fixturesSnap) {
+      const f   = doc.data ? doc.data() : doc;
+      const fid = doc.id;
+      const pidA = f.playerAId;
+      const pidB = f.playerBId;
+      if (!pidA || !pidB) continue;
+
+      const prob = _calcProbability(pidA, pidB);
+      results.push({
+        fixtureId: fid,
+        playerAId: pidA,
+        playerBId: pidB,
+        playerAName: playerMap[pidA]?.clubName || pidA,
+        playerBName: playerMap[pidB]?.clubName || pidB,
+        matchDay: f.matchday || null,
+        status: f.status || null,
+        ...prob
+      });
+    }
+
+    // ── Cache full season probabilities to Firestore ──────────────────────
+    if (!fixtureId) {
+      db.collection('config').doc('matchProbabilities').set({
+        seasonId: sid,
+        probabilities: results,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }).catch(e => console.error('[CEE] prob cache write failed:', e.message));
+    }
+
+    return res.json({ success: true, seasonId: sid, probabilities: results });
+  } catch(e) {
+    console.error('[CEE] getMatchProbabilities error:', e.message);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// GET /getScoutReport — returns cached scout report if available
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/getScoutReport', async (req, res) => {
+  const { requestingPlayerId, opponentPlayerId, seasonId } = req.query;
+  if (!requestingPlayerId || !opponentPlayerId || !seasonId) {
+    return res.status(400).json({ success: false, message: 'Missing fields.' });
+  }
+  try {
+    const reportDocId = `${requestingPlayerId}_${opponentPlayerId}_${seasonId}`;
+    const snap = await db.collection('scoutReports').doc(reportDocId).get();
+    if (!snap.exists) return res.json({ success: false, reason: 'no_cache', message: 'No report generated yet.' });
+    const r = snap.data();
+    // Check if opponent has played new matches since last generation
+    const latestOppSnap = await db.collection('matchStats')
+      .where('playerId', '==', opponentPlayerId)
+      .where('seasonId', '==', seasonId)
+      .orderBy('verifiedAt', 'desc')
+      .limit(1)
+      .get();
+    let isStale = false;
+    if (!latestOppSnap.empty) {
+      const latestId = latestOppSnap.docs[0].id;
+      isStale = r.opponentLastMatchId !== latestId;
+    }
+    return res.json({
+      success: true,
+      cached: true,
+      isStale,
+      reportText: r.reportText,
+      upgradeText: r.upgradeText || '',
+      matchesAnalysed: r.matchesAnalysed,
+      opponentName: r.opponentName || null,
+      generatedAt: r.generatedAt ? r.generatedAt.toDate().toISOString() : null
+    });
+  } catch(e) {
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /adminSetIntelligenceConfig — admin enable/disable switch
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/adminSetIntelligenceConfig', async (req, res) => {
+  if (!assertAdminSecret(req, res)) return;
+  const { analysisEnabled } = req.body;
+  if (typeof analysisEnabled !== 'boolean') return res.status(400).json({ success: false, message: 'analysisEnabled must be boolean.' });
+  try {
+    await db.collection('config').doc('intelligence').set({ analysisEnabled }, { merge: true });
+    await audit('INTELLIGENCE_CONFIG', 'config', 'intelligence', `analysisEnabled set to ${analysisEnabled}`);
+    return res.json({ success: true });
+  } catch(e) { return res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /adminGetIntelligenceConfig — returns current intelligence config + stats
+app.get('/adminGetIntelligenceConfig', async (req, res) => {
+  if (!assertAdminSecret(req, res)) return;
+  try {
+    const doc = await db.collection('config').doc('intelligence').get();
+    const data = doc.exists ? doc.data() : {};
+    const reportsSnap = await db.collection('scoutReports').get();
+    return res.json({ success: true, analysisEnabled: data.analysisEnabled !== false, reportsGenerated: reportsSnap.size, lastGeminiCallAt: data.lastGeminiCallAt ? data.lastGeminiCallAt.toDate().toISOString() : null, reportsGeneratedTotal: data.reportsGeneratedTotal || 0 });
+  } catch(e) { return res.status(500).json({ success: false, message: e.message }); }
+});
+
+
 app.post('/testAiVerify', async (req, res) => {
   if (!assertAdminSecret(req, res)) return;
-  // Redirect to the new endpoint internally
-  req.body.imageBase64 = req.body.screenshotBase64;
-  return res.redirect(307, '/adminVerifyScreenshot');
+  const { screenshotBase64, mimeType, playerAGoals, playerBGoals } = req.body;
+  if (!screenshotBase64) return res.status(400).json({ success: false, message: 'Missing screenshotBase64' });
+  try {
+    const _gr3 = await _geminiPost({
+        contents: [{ parts: [
+          { inline_data: { mime_type: mimeType || 'image/jpeg', data: screenshotBase64 } },
+          { text: `You are analyzing an eFootball (soccer video game) post-match result screen.\nRespond ONLY in JSON, no other text, no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<club name or null>",\n  "awayClubName": "<club name or null>",\n  "isPlausibleScore": true/false,\n  "confidence": <float 0.0-1.0>\n}\nRules:\n- isEfootballResultScreen: true only if clearly eFootball post-match result screen\n- isFullResultScreen: true only if shows complete final result\n- homeGoals/awayGoals: final score integers, null if not readable\n- isPlausibleScore: false if GD>=10 or either score>20\n- confidence: 1.0=certain, 0.0=cannot read` }
+        ]}],
+        generationConfig: { maxOutputTokens: 300, temperature: 0 }
+      });
+    if (!_gr3.ok) throw new Error(_gr3.error || 'Gemini Vision call failed');
+    const raw = (_gr3.data.candidates&&_gr3.data.candidates[0]&&_gr3.data.candidates[0].content&&_gr3.data.candidates[0].content.parts&&_gr3.data.candidates[0].content.parts[0]&&_gr3.data.candidates[0].content.parts[0].text) || '{}';
+    const ai = JSON.parse(raw.replace(/```json|```/g,'').trim());
+    const conf = ai.confidence || 0;
+    const expectedA = parseInt(playerAGoals) || 0;
+    const expectedB = parseInt(playerBGoals) || 0;
+    const detectedA = ai.homeGoals !== null && ai.homeGoals !== undefined ? ai.homeGoals : '?';
+    const detectedB = ai.awayGoals !== null && ai.awayGoals !== undefined ? ai.awayGoals : '?';
+    const scoreMatch = (detectedA === expectedA && detectedB === expectedB) || (detectedA === expectedB && detectedB === expectedA);
+    const aiApproved = ai.isEfootballResultScreen && ai.isFullResultScreen && conf >= 0.85 && scoreMatch;
+    return res.json({
+      success: true,
+      aiApproved,
+      confidence: conf,
+      detectedScore: `${detectedA} - ${detectedB}`,
+      expectedScore: `${expectedA} - ${expectedB}`,
+      scoreMatch,
+      isEfootballResultScreen: ai.isEfootballResultScreen,
+      isFullResultScreen: ai.isFullResultScreen,
+      homeClubName: ai.homeClubName,
+      awayClubName: ai.awayClubName,
+      aiNotes: ai.isEfootballResultScreen ? (scoreMatch ? 'Score matches expected result' : `Score mismatch: detected ${detectedA}-${detectedB}, expected ${expectedA}-${expectedB}`) : 'Not an eFootball result screen'
+    });
+  } catch(e) {
+    console.error('[CEE] testAiVerify error:', e.message);
+    return res.json({ success: false, message: e.message });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4200,7 +5503,7 @@ app.listen(PORT, () => {
     'ADMIN_SECRET':             !!process.env.ADMIN_SECRET,
     'ADMIN_EMAIL':              !!process.env.ADMIN_EMAIL,
     'PAYSTACK_SECRET':          !!process.env.PAYSTACK_SECRET,
-    'GEMINI_KEY':               !!process.env.GEMINI_KEY,
+    'GEMINI_KEY_1':             !!_geminiKeys.length,
     'VAPID_PUBLIC_KEY':         !!process.env.VAPID_PUBLIC_KEY,
     'VAPID_PRIVATE_KEY':        !!process.env.VAPID_PRIVATE_KEY,
   };
