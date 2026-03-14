@@ -1910,7 +1910,7 @@ app.post('/submitScore', async (req, res) => {
             {inline_data:{mime_type:mediaType||'image/jpeg',data:imageData}},
             {text:`You are the CEE Anti-Cheat Vision System — a fraud detection and stat extraction engine for the Campus eSports Elite eFootball tournament.\n\nYour job has TWO parts:\n\nPART 1 — FRAUD DETECTION (reason independently):\nExamine this screenshot and identify anything suspicious or inconsistent. Do NOT rely on rules given to you — reason from what you actually see in the image. Look for:\n- Signs of image editing: inconsistent fonts, pixel artifacts, blurry number regions, mismatched background textures, sharp edges around numbers suggesting overlay\n- Statistical impossibilities: e.g. more shots on target than total shots, possession values not summing to ~100, saves > shots on target, successful passes > total passes\n- Score/stat coherence: can the goals scored be explained by the shots on target and saves shown?\n- UI authenticity: does the screen look like a genuine eFootball post-match stats board? Check layout, colors, fonts, positioning of all elements\n- Scoreline plausibility: is the goal difference extreme? Are stats consistent with a high-scoring match?\n\nPART 2 — STAT EXTRACTION:\nExtract every number from the stats table precisely.\n\nRespond ONLY in JSON, no other text, no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<string or null>",\n  "awayClubName": "<string or null>",\n  "isPlausibleScore": true/false,\n  "confidence": <float 0.0-1.0>,\n  "fraudSuspicion": <float 0.0-1.0>,\n  "fraudIndicators": [<array of strings — each a specific suspicious observation, empty array if none>],\n  "statisticalAnomalies": [<array of strings — each a stat that is mathematically inconsistent, empty if none>],\n  "uiAuthenticityScore": <float 0.0-1.0>,\n  "possessionHome": <integer 0-100 or null>,\n  "possessionAway": <integer 0-100 or null>,\n  "shotsHome": <integer or null>,\n  "shotsAway": <integer or null>,\n  "shotsOnTargetHome": <integer or null>,\n  "shotsOnTargetAway": <integer or null>,\n  "foulsHome": <integer or null>,\n  "foulsAway": <integer or null>,\n  "offsidesHome": <integer or null>,\n  "offsidesAway": <integer or null>,\n  "cornerKicksHome": <integer or null>,\n  "cornerKicksAway": <integer or null>,\n  "freeKicksHome": <integer or null>,\n  "freeKicksAway": <integer or null>,\n  "passesHome": <integer or null>,\n  "passesAway": <integer or null>,\n  "successfulPassesHome": <integer or null>,\n  "successfulPassesAway": <integer or null>,\n  "crossesHome": <integer or null>,\n  "crossesAway": <integer or null>,\n  "interceptionsHome": <integer or null>,\n  "interceptionsAway": <integer or null>,\n  "tacklesHome": <integer or null>,\n  "tacklesAway": <integer or null>,\n  "savesHome": <integer or null>,\n  "savesAway": <integer or null>\n}\nField rules:\n- fraudSuspicion: your overall confidence this screenshot has been tampered with. 0.0=definitely real, 1.0=definitely fraudulent. Be precise — do not default to 0.5.\n- fraudIndicators: list every specific visual or structural anomaly you detected. If none, empty array.\n- statisticalAnomalies: list any stat values that are mathematically impossible or highly improbable given the other stats.\n- uiAuthenticityScore: how closely the UI matches a genuine eFootball post-match stats board. 1.0=perfect match, 0.0=clearly not eFootball.\n- isPlausibleScore: false if goal difference >= 8 or either score > 15\n- confidence: your certainty that ALL stat values were read correctly. 1.0=certain, 0.0=unreadable.\n- possessionHome + possessionAway must sum to approximately 100\n- successfulPasses must be <= passes for each team\n- shotsOnTarget must be <= shots for each team\n- saves must be <= shotsOnTarget of the OPPOSING team\n- Set isEfootballResultScreen/isFullResultScreen to false and all stats to null if this is not a genuine eFootball stats board`}
           ]}],
-          generationConfig:{maxOutputTokens:4000,temperature:0}
+          generationConfig:{maxOutputTokens:5000,temperature:0}
         });
       if (!_gRes.ok) throw new Error(_gRes.error || 'Gemini Vision call failed');
       const raw=(_gRes.data.candidates&&_gRes.data.candidates[0]&&_gRes.data.candidates[0].content&&_gRes.data.candidates[0].content.parts&&_gRes.data.candidates[0].content.parts[0]&&_gRes.data.candidates[0].content.parts[0].text)||'{}';
@@ -3979,6 +3979,9 @@ db.collection('registrations').onSnapshot(snapshot => {
 // Implements caching: report is reused until opponent plays a new match.
 // ═══════════════════════════════════════════════════════════════════════════
 app.post('/analyzeOpponent', async (req, res) => {
+  // Extend timeout to 120s — this endpoint makes 2 large Gemini calls
+  req.setTimeout(120000);
+  res.setTimeout(120000);
   const { requestingPlayerId, opponentPlayerId, seasonId, fixtureId } = req.body;
   if (!requestingPlayerId || !opponentPlayerId || !seasonId) {
     return res.status(400).json({ success: false, message: 'Missing required fields.' });
@@ -5109,7 +5112,7 @@ Every fix in the upgrade plan must be actionable for ${reqPlayer.clubName} speci
     try {
       const _gr1 = await _geminiPost({
           contents: [{ parts: [{ text: fullPrompt }] }],
-          generationConfig: { maxOutputTokens: 4000, temperature: 0 }
+          generationConfig: { maxOutputTokens:5000, temperature: 0 }
         });
       if (!_gr1.ok) throw new Error(_gr1.error || 'Gemini Call 1 failed');
       reportText = (_gr1.data.candidates&&_gr1.data.candidates[0]&&_gr1.data.candidates[0].content&&_gr1.data.candidates[0].content.parts&&_gr1.data.candidates[0].content.parts[0]&&_gr1.data.candidates[0].content.parts[0].text) || '';
@@ -5127,7 +5130,7 @@ Every fix in the upgrade plan must be actionable for ${reqPlayer.clubName} speci
     try {
       const _gr2 = await _geminiPost({
           contents: [{ parts: [{ text: upgradeSubPrompt + reportText }] }],
-          generationConfig: { maxOutputTokens: 2500, temperature: 0 }
+          generationConfig: { maxOutputTokens:5000, temperature: 0 }
         });
       if (_gr2.ok) {
         upgradeText = (_gr2.data.candidates&&_gr2.data.candidates[0]&&_gr2.data.candidates[0].content&&_gr2.data.candidates[0].content.parts&&_gr2.data.candidates[0].content.parts[0]&&_gr2.data.candidates[0].content.parts[0].text) || '';
@@ -5504,7 +5507,7 @@ app.post('/testAiVerify', async (req, res) => {
           { inline_data: { mime_type: mimeType || 'image/jpeg', data: screenshotBase64 } },
           { text: 'This is a screenshot from an eFootball video game. Read the final score and team names from the results screen.\nRespond ONLY in JSON with no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<string or null>",\n  "awayClubName": "<string or null>",\n  "isPlausibleScore": true/false,\n  "imageQualityScore": <float 0.0-1.0>,\n  "uiMatchScore": <float 0.0-1.0>,\n  "readingIssues": [],\n  "statAnomalies": [],\n  "confidence": <float 0.0-1.0>\n}\nNotes:\n- isPlausibleScore: false only if goal difference >= 10 or either score > 20\n- imageQualityScore: how clearly the image can be read (1.0 = perfect)\n- uiMatchScore: how closely this matches a real eFootball results screen\n- readingIssues: list any parts of the screen that were hard to read\n- confidence: overall certainty all values are correct' }
         ]}],
-        generationConfig: { maxOutputTokens: 500, temperature: 0 }
+        generationConfig: { maxOutputTokens:5000, temperature: 0 }
       });
     if (!_gr3.ok) throw new Error(_gr3.error || 'Gemini Vision call failed');
     const rawText = (_gr3.data.candidates&&_gr3.data.candidates[0]&&_gr3.data.candidates[0].content&&_gr3.data.candidates[0].content.parts&&_gr3.data.candidates[0].content.parts[0]&&_gr3.data.candidates[0].content.parts[0].text) || '';
