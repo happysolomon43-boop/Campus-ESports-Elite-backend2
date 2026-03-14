@@ -5449,12 +5449,12 @@ app.post('/approveResult', async (req, res) => {
     });
 
     // Notify both players
-    await _handleNotification('RESULT_APPROVED', fixtureId, fix.playerAId, fix.playerBId);
+    const seasonId = fix.seasonId || await getSeasonId();
+    await _sendMatchNotifications('RESULT_APPROVED', fixtureId, fix.playerAId, fix.playerBId, seasonId);
 
     // Recalculate standings
-    const seasonId = fix.seasonId || await getSeasonId();
     if (seasonId) {
-      recalculateStandings(seasonId).catch(e =>
+      _recalcStandingsInternal(seasonId).catch(e =>
         console.error('[CEE] approveResult standings error:', e.message)
       );
     }
