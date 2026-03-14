@@ -1163,18 +1163,32 @@ async function _recalculatePlayerTiers(seasonId, sortedStandings) {
     const goalsPerMatch = matches.reduce((acc, m) => acc + (m.goalsFor || 0), 0) / n;
     const goalsScore = Math.min(100, (goalsPerMatch / 5) * 100);
 
-    // Defensive record — invert goals conceded per match (0 conceded = 100, 5+ = 0)
+    // Defensive record -- invert goals conceded per match (0 conceded = 100, 5+ = 0)
     const concededPerMatch = matches.reduce((acc, m) => acc + (m.goalsAgainst || 0), 0) / n;
     const defScore = Math.max(0, Math.min(100, (1 - concededPerMatch / 5) * 100));
 
-    // Weighted PR
+    // Defensive activity -- tackles + interceptions combined, normalised to 0-100
+    // 10+ combined per match = 100, 0 = 0. Rewards active defenders.
+    const defActivityVals = matches.map(m => {
+      const t = m.stats && m.stats.tackles       != null ? m.stats.tackles       : null;
+      const i = m.stats && m.stats.interceptions != null ? m.stats.interceptions : null;
+      if (t === null && i === null) return null;
+      return (t || 0) + (i || 0);
+    }).filter(v => v !== null);
+    const defActivityAvg   = defActivityVals.length ? defActivityVals.reduce((a,b) => a+b,0) / defActivityVals.length : 5;
+    const defActivityScore = Math.min(100, (defActivityAvg / 10) * 100);
+
+    // Weighted PR (sums to 100%):
+    //   Win rate 30% | GD/match 20% | Shot acc 15% | Pass acc 12%
+    //   Goals/match 8% | Def record 5% | Def activity 10%
     const pr = Math.round(
-      winRate      * 0.35 +
-      gdScore      * 0.20 +
-      shotAcc      * 0.15 +
-      passAcc      * 0.15 +
-      goalsScore   * 0.10 +
-      defScore     * 0.05
+      winRate          * 0.30 +
+      gdScore          * 0.20 +
+      shotAcc          * 0.15 +
+      passAcc          * 0.12 +
+      goalsScore       * 0.08 +
+      defScore         * 0.05 +
+      defActivityScore * 0.10
     );
 
     prScores.push({ playerId: pid, pr, matchCount: n, winRate: Math.round(winRate), gdPerMatch: Math.round(gdPerMatch * 10) / 10 });
@@ -1218,6 +1232,49 @@ async function _recalculatePlayerTiers(seasonId, sortedStandings) {
   await batch.commit();
   console.log(`[CEE] Tiers assigned: ${prScores.filter((_,i) => i < eliteCutoff).length} Elite, ${prScores.filter((_,i) => i >= eliteCutoff && i < midCutoff).length} Mid, ${prScores.filter((_,i) => i >= midCutoff).length} Underdog (${total} total ranked)`);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PLAYER INTEGRITY SCORE ENGINE
+// Tracks cumulative fraud signal pattern per player across all submissions.
+// No single submission blocks a player unfairly -- pattern must accumulate.
+// Score: starts 100. Hard flag -15, soft flag -3, clean submission +1.
+// Score < 70: admin alerted, enhanced review flagged on future submissions.
+// Score < 50: player auto-blocked pending admin review.
+// ═══════════════════════════════════════════════════════════════════════════
+async function _updatePlayerIntegrityScore(playerId, type) {
+  try {
+    const pd = await db.collection('players').doc(playerId).get();
+    if (!pd.exists) return;
+    const p = pd.data();
+    const current = p.integrityScore != null ? p.integrityScore : 100;
+    let delta = 0;
+    if (type === 'hard_flag') delta = -15;
+    else if (type === 'soft_flag') delta = -3;
+    else if (type === 'clean') delta = 1;
+    const newScore = Math.max(0, Math.min(100, current + delta));
+    const update = { integrityScore: newScore, integrityLastUpdated: admin.firestore.FieldValue.serverTimestamp() };
+    const adminChat = env.telegram && env.telegram.admin_chat_id;
+    // Auto-block when score first drops below 50
+    if (newScore < 50 && current >= 50) {
+      update.hubBlocked = true;
+      update.hubBlockedReason = `Integrity score ${newScore}/100 -- auto-suspended pending admin review`;
+      update.hubBlockedAt = admin.firestore.FieldValue.serverTimestamp();
+      if (adminChat) sendTelegram(adminChat,
+        `PLAYER AUTO-SUSPENDED (Integrity)\nPlayer: ${playerId}\nClub: ${p.clubName||'?'}\nScore: ${newScore}/100\nPattern of fraud flags triggered suspension. Review in admin panel.`
+      ).catch(()=>{});
+      await audit('INTEGRITY_AUTO_BLOCK', playerId, 'player', `Integrity score ${newScore} -- auto-suspended`);
+    }
+    // Warn admin when score first drops below 70
+    if (newScore < 70 && current >= 70) {
+      if (adminChat) sendTelegram(adminChat,
+        `INTEGRITY WARNING\nPlayer: ${p.clubName||playerId}\nScore dropped to ${newScore}/100 -- enhanced review now active.`
+      ).catch(()=>{});
+    }
+    await db.collection('players').doc(playerId).update(update);
+    console.log(`[CEE] Integrity: ${playerId} ${current} -> ${newScore} (${type})`);
+  } catch(e) { console.error('[CEE] _updatePlayerIntegrityScore error:', e.message); }
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // INTERNAL: _checkKnockoutQualification — Auto-12/17
@@ -1945,7 +2002,7 @@ app.post('/submitScore', async (req, res) => {
             {inline_data:{mime_type:mediaType||'image/jpeg',data:imageData}},
             {text:`You are the CEE Anti-Cheat Vision System — a fraud detection and stat extraction engine for the Campus eSports Elite eFootball tournament.\n\nYour job has TWO parts:\n\nPART 1 — FRAUD DETECTION (reason independently):\nExamine this screenshot and identify anything suspicious or inconsistent. Do NOT rely on rules given to you — reason from what you actually see in the image. Look for:\n- Signs of image editing: inconsistent fonts, pixel artifacts, blurry number regions, mismatched background textures, sharp edges around numbers suggesting overlay\n- Statistical impossibilities: e.g. more shots on target than total shots, possession values not summing to ~100, saves > shots on target, successful passes > total passes\n- Score/stat coherence: can the goals scored be explained by the shots on target and saves shown?\n- UI authenticity: does the screen look like a genuine eFootball post-match stats board? Check layout, colors, fonts, positioning of all elements\n- Scoreline plausibility: is the goal difference extreme? Are stats consistent with a high-scoring match?\n\nPART 2 — STAT EXTRACTION:\nExtract every number from the stats table precisely.\n\nRespond ONLY in JSON, no other text, no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<string or null>",\n  "awayClubName": "<string or null>",\n  "isPlausibleScore": true/false,\n  "confidence": <float 0.0-1.0>,\n  "fraudSuspicion": <float 0.0-1.0>,\n  "fraudIndicators": [<array of strings — each a specific suspicious observation, empty array if none>],\n  "statisticalAnomalies": [<array of strings — each a stat that is mathematically inconsistent, empty if none>],\n  "uiAuthenticityScore": <float 0.0-1.0>,\n  "possessionHome": <integer 0-100 or null>,\n  "possessionAway": <integer 0-100 or null>,\n  "shotsHome": <integer or null>,\n  "shotsAway": <integer or null>,\n  "shotsOnTargetHome": <integer or null>,\n  "shotsOnTargetAway": <integer or null>,\n  "foulsHome": <integer or null>,\n  "foulsAway": <integer or null>,\n  "offsidesHome": <integer or null>,\n  "offsidesAway": <integer or null>,\n  "cornerKicksHome": <integer or null>,\n  "cornerKicksAway": <integer or null>,\n  "freeKicksHome": <integer or null>,\n  "freeKicksAway": <integer or null>,\n  "passesHome": <integer or null>,\n  "passesAway": <integer or null>,\n  "successfulPassesHome": <integer or null>,\n  "successfulPassesAway": <integer or null>,\n  "crossesHome": <integer or null>,\n  "crossesAway": <integer or null>,\n  "interceptionsHome": <integer or null>,\n  "interceptionsAway": <integer or null>,\n  "tacklesHome": <integer or null>,\n  "tacklesAway": <integer or null>,\n  "savesHome": <integer or null>,\n  "savesAway": <integer or null>\n}\nField rules:\n- fraudSuspicion: your overall confidence this screenshot has been tampered with. 0.0=definitely real, 1.0=definitely fraudulent. Be precise — do not default to 0.5.\n- fraudIndicators: list every specific visual or structural anomaly you detected. If none, empty array.\n- statisticalAnomalies: list any stat values that are mathematically impossible or highly improbable given the other stats.\n- uiAuthenticityScore: how closely the UI matches a genuine eFootball post-match stats board. 1.0=perfect match, 0.0=clearly not eFootball.\n- isPlausibleScore: false if goal difference >= 8 or either score > 15\n- confidence: your certainty that ALL stat values were read correctly. 1.0=certain, 0.0=unreadable.\n- possessionHome + possessionAway must sum to approximately 100\n- successfulPasses must be <= passes for each team\n- shotsOnTarget must be <= shots for each team\n- saves must be <= shotsOnTarget of the OPPOSING team\n- Set isEfootballResultScreen/isFullResultScreen to false and all stats to null if this is not a genuine eFootball stats board`}
           ]}],
-          generationConfig:{maxOutputTokens:5000,temperature:0}
+          generationConfig:{maxOutputTokens:8000,temperature:0}
         });
       if (!_gRes.ok) throw new Error(_gRes.error || 'Gemini Vision call failed');
       const raw=(_gRes.data.candidates&&_gRes.data.candidates[0]&&_gRes.data.candidates[0].content&&_gRes.data.candidates[0].content.parts&&_gRes.data.candidates[0].content.parts[0]&&_gRes.data.candidates[0].content.parts[0].text)||'{}';
@@ -1954,7 +2011,7 @@ app.post('/submitScore', async (req, res) => {
 
     if (!ai.isEfootballResultScreen||!ai.isFullResultScreen) {
       await audit('ANTICHEAT_INVALID_SCREENSHOT',fixtureId,'fixture',`Player ${playerId} submitted non-eFootball screenshot`);
-      return res.json({ success:false, message:'Not a valid eFootball result screen. Upload the correct screenshot.' });
+      return res.json({ success:false, verificationState:'REJECTED', message:'❌ Not a valid eFootball result screen. Make sure you are submitting the full post-match stats screen, not a lineup, menu or other screen.' });
     }
     if (!ai.isPlausibleScore) {
       await fixRef.update({ collusionFlagGD:true });
@@ -1992,58 +2049,60 @@ app.post('/submitScore', async (req, res) => {
     const statAnomalies    = Array.isArray(ai.statisticalAnomalies) ? ai.statisticalAnomalies : [];
 
     let flagged = false, flagReason = '';
+    // verificationState: 'APPROVED' | 'NEEDS_REVIEW' | 'REJECTED'
+    let verificationState = 'APPROVED';
 
-    // ── AI Fraud Detection — act on what Gemini independently flagged ────────
+    // ── HARD REJECT: UI does not look like eFootball ─────────────────────────
+    if (uiAuthScore < 0.50) {
+      await fixRef.update({ screenshotFlaggedForReview: true, screenshotFlagReason: `UI authenticity too low (${Math.round(uiAuthScore*100)}%)`, status: 'admin_arbitration', fraudArbitrationAt: admin.firestore.FieldValue.serverTimestamp() });
+      await audit('ANTICHEAT_UI_REJECTED', fixtureId, 'fixture', `UI authenticity ${Math.round(uiAuthScore*100)}% -- hard rejected`);
+      _updatePlayerIntegrityScore(playerId, 'hard_flag').catch(()=>{});
+      return res.json({ success: false, verificationState: 'REJECTED', message: `Screenshot rejected -- does not appear to be a genuine eFootball post-match stats screen (${Math.round(uiAuthScore*100)}% authenticity). Upload the correct screenshot.` });
+    }
+
+    // ── AI Fraud Detection ────────────────────────────────────────────────────
     if (fraudSuspicion >= 0.75) {
-      // High suspicion — block immediately, send to admin arbitration
       const fraudDetail = [
         `AI fraud suspicion: ${Math.round(fraudSuspicion*100)}%`,
         `UI authenticity: ${Math.round(uiAuthScore*100)}%`,
         fraudIndicators.length ? 'Indicators: ' + fraudIndicators.join(' | ') : '',
         statAnomalies.length   ? 'Stat anomalies: ' + statAnomalies.join(' | ') : ''
-      ].filter(Boolean).join(' — ');
+      ].filter(Boolean).join(' -- ');
       await fixRef.update({ screenshotFlaggedForReview: true, screenshotFlagReason: fraudDetail, status: 'admin_arbitration', fraudArbitrationAt: admin.firestore.FieldValue.serverTimestamp() });
       await audit('ANTICHEAT_FRAUD_DETECTED', fixtureId, 'fixture', `High fraud suspicion from AI: ${fraudDetail}`);
-      const adminChat = env.telegram.admin_chat_id;
-      if (adminChat) await sendTelegram(adminChat, `🚨 <b>FRAUD ALERT</b>
-
-Fixture: <code>${fixtureId}</code>
-Player: <code>${playerId}</code>
-AI suspicion: <b>${Math.round(fraudSuspicion*100)}%</b>
-${fraudIndicators.length ? '🔍 ' + fraudIndicators.slice(0,3).join(' | ') : ''}
-
-<b>Action required — Admin Arbitration</b>`);
-      return res.json({ success: false, message: 'Screenshot failed authenticity check. This submission has been flagged for admin review.' });
+      _updatePlayerIntegrityScore(playerId, 'hard_flag').catch(()=>{});
+      const adminChat = env.telegram && env.telegram.admin_chat_id;
+      if (adminChat) await sendTelegram(adminChat, `FRAUD ALERT\n\nFixture: ${fixtureId}\nPlayer: ${playerId}\nAI suspicion: ${Math.round(fraudSuspicion*100)}%\n${fraudIndicators.length ? fraudIndicators.slice(0,3).join(' | ') : ''}\n\nAction required -- Admin Arbitration`);
+      return res.json({ success: false, verificationState: 'REJECTED', message: 'Screenshot failed our authenticity check. This submission has been flagged for admin review. Contact the league admin if you believe this is an error.' });
     } else if (fraudSuspicion >= 0.45) {
-      // Moderate suspicion — flag for review but allow submission
       flagged = true;
-      flagReason = `AI fraud suspicion ${Math.round(fraudSuspicion*100)}% — ${fraudIndicators.slice(0,2).join('; ') || 'review recommended'}`;
+      verificationState = 'NEEDS_REVIEW';
+      flagReason = `AI fraud suspicion ${Math.round(fraudSuspicion*100)}% -- ${fraudIndicators.slice(0,2).join('; ') || 'review recommended'}`;
+      _updatePlayerIntegrityScore(playerId, 'soft_flag').catch(()=>{});
     }
 
-    // ── Stat anomaly flag (independent of fraud suspicion) ─────────────────
+    // ── Stat anomaly flag ─────────────────────────────────────────────────────
     if (statAnomalies.length > 0 && !flagged) {
       flagged = true;
+      verificationState = 'NEEDS_REVIEW';
       flagReason = `Statistical anomalies detected: ${statAnomalies.slice(0,2).join('; ')}`;
     }
 
-    // ── UI authenticity too low ─────────────────────────────────────────────
-    if (uiAuthScore < 0.50 && !flagged) {
-      flagged = true;
-      flagReason = `Low UI authenticity score (${Math.round(uiAuthScore*100)}%) — screenshot may not be genuine eFootball`;
-    }
-
-    // ── Standard confidence check ───────────────────────────────────────────
+    // ── Standard confidence check ─────────────────────────────────────────────
     if (!flagged) {
       if (conf < 0.60) {
         const retryKey = isHome ? 'playerARetryCount' : 'playerBRetryCount';
         const retries  = fix[retryKey] || 0;
-        if (retries >= 1) { flagged = true; flagReason = 'Low AI confidence after retry — admin review required'; }
-        else { await fixRef.update({ [retryKey]: retries+1 }); return res.json({ success:false, retry:true, confidence:conf, message:`Screenshot unclear (${Math.round(conf*100)}% confidence). Upload a clearer result screen. 1 retry remaining.` }); }
+        if (retries >= 1) { flagged = true; verificationState = 'NEEDS_REVIEW'; flagReason = 'Low AI confidence after retry -- admin review required'; }
+        else { await fixRef.update({ [retryKey]: retries+1 }); return res.json({ success:false, verificationState:'NEEDS_REVIEW', retry:true, confidence:conf, message:`Screenshot was unclear (${Math.round(conf*100)}% confidence). Try a brighter, sharper image of the full stats screen. You have 1 retry remaining.` }); }
       } else if (conf < 0.85) {
-        flagged = true; flagReason = `AI confidence ${Math.round(conf*100)}% — below auto-accept threshold`;
+        flagged = true;
+        verificationState = 'NEEDS_REVIEW';
+        flagReason = `AI confidence ${Math.round(conf*100)}% -- below auto-accept threshold`;
+      } else {
+        _updatePlayerIntegrityScore(playerId, 'clean').catch(()=>{});
       }
     }
-
     const fname=`screenshots/${fixtureId}/${playerId}/${Date.now()}.jpg`;
     const bucket=storage.bucket(), file=bucket.file(fname);
     await file.save(imgBuf,{metadata:{contentType:mediaType||'image/jpeg'}});
@@ -2114,6 +2173,19 @@ ${fraudIndicators.length ? '🔍 ' + fraudIndicators.slice(0,3).join(' | ') : ''
       };
       db.collection('matchStats').doc(matchStatDocId).set(msWrite, { merge:true })
         .catch(e => console.error('[CEE] matchStats write failed (non-blocking):', e.message));
+
+      // ── C4: Rebuild playstyle fingerprint for this player (non-blocking) ──
+      _buildPlaystyleFingerprint(playerId, seasonId).catch(
+        e => console.error('[CEE] playstyleFingerprint error (non-blocking):', e.message)
+      );
+
+      // ── CEE INTELLIGENCE: Quick Match Analysis + Progressive Tips ────────────
+      // Fires non-blocking after every verified submission.
+      // Generates instant AI analysis of this match + comparison tips vs last match.
+      _generateQuickAnalysis(playerId, fixtureId, fix, isHome, ai, myStats, matchContext).catch(
+        e => console.error('[CEE] quickAnalysis error (non-blocking):', e.message)
+      );
+
     } catch(msErr){ console.error('[CEE] matchStats prep error:', msErr.message); }
 
     const fresh=(await fixRef.get()).data();
@@ -2192,8 +2264,270 @@ ${fraudIndicators.length ? '🔍 ' + fraudIndicators.slice(0,3).join(' | ') : ''
       }
     } else { await logNotif(fixtureId,playerId,'telegram','SUBMISSION_RECEIVED','sent'); }
 
-    return res.json({ success:true, confidence:conf, message:'Screenshot sealed. Awaiting opponent submission.' });
+    const _detectedA = ai.homeGoals !== null && ai.homeGoals !== undefined ? ai.homeGoals : '?';
+    const _detectedB = ai.awayGoals !== null && ai.awayGoals !== undefined ? ai.awayGoals : '?';
+    return res.json({ success:true, verificationState, confidence:conf, detectedScore:`${_detectedA} - ${_detectedB}`, homeGoals: ai.homeGoals, awayGoals: ai.awayGoals, message: verificationState === 'NEEDS_REVIEW' ? 'Screenshot received but flagged for admin review. Result will be confirmed once reviewed.' : 'Screenshot verified and sealed. Awaiting opponent submission.' });
   } catch(e){ console.error('[CEE] submitScore:',e); return res.status(500).json({ success:false, message:'Server error: '+e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C4: PLAYSTYLE FINGERPRINT ENGINE
+// Aggregates ALL-TIME formation, attack direction, and pressing tendencies
+// across every verified matchStats doc for a player.
+// Stored as playerProfile/{playerId} — injected into scout reports as
+// confirmed tendencies rather than per-match observations.
+// Updates non-blocking after every new match submission.
+// ═══════════════════════════════════════════════════════════════════════════
+async function _buildPlaystyleFingerprint(playerId, seasonId) {
+  try {
+    // Fetch all matchStats for this player this season
+    const snap = await db.collection('matchStats')
+      .where('playerId', '==', playerId)
+      .where('seasonId', '==', seasonId)
+      .get();
+
+    if (snap.empty) return;
+
+    const matches = [];
+    snap.forEach(d => matches.push(d.data()));
+
+    // ── Also pull from identity-linked previous player IDs ───────────────────
+    // This makes the fingerprint truly all-time, not just current season.
+    // A player's confirmed patterns from previous seasons are included.
+    try {
+      const pdSnap = await db.collection('players').doc(playerId).get();
+      if (pdSnap.exists) {
+        const linkedIds = pdSnap.data().linkedPreviousPlayerIds || [];
+        if (linkedIds.length > 0) {
+          const batchSize = Math.min(linkedIds.length, 10);
+          const histSnap = await db.collection('matchStats')
+            .where('playerId', 'in', linkedIds.slice(0, batchSize))
+            .get();
+          histSnap.forEach(d => matches.push({ ...d.data(), _historical: true }));
+        }
+      }
+    } catch(e) { /* non-fatal — fingerprint still works from current season only */ }
+
+    const n = matches.length;
+
+    // ── Formation frequency ──────────────────────────────────────────────────
+    const formationCount = {};
+    matches.forEach(m => {
+      if (m.context && m.context.formation) {
+        formationCount[m.context.formation] = (formationCount[m.context.formation] || 0) + 1;
+      }
+    });
+    const formationEntries = Object.entries(formationCount)
+      .sort((a, b) => b[1] - a[1])
+      .map(([f, cnt]) => ({ formation: f, count: cnt, pct: Math.round((cnt / n) * 100) }));
+
+    // ── Attack direction frequency ────────────────────────────────────────────
+    const attackCount = {};
+    matches.forEach(m => {
+      if (m.context && m.context.attackDirection) {
+        attackCount[m.context.attackDirection] = (attackCount[m.context.attackDirection] || 0) + 1;
+      }
+    });
+    const attackEntries = Object.entries(attackCount)
+      .sort((a, b) => b[1] - a[1])
+      .map(([dir, cnt]) => ({ direction: dir, count: cnt, pct: Math.round((cnt / n) * 100) }));
+
+    // ── Behavioural tendencies ────────────────────────────────────────────────
+    const ctxMatches = matches.filter(m => m.context);
+    const ctxN = ctxMatches.length || 1;
+    const pressing   = ctxMatches.filter(m => m.context.opponentPressing   === true).length;
+    const defensive  = ctxMatches.filter(m => m.context.opponentDefensive  === true).length;
+    const scoredFirst= ctxMatches.filter(m => m.context.scoredFirst        === true).length;
+    const setpiece   = ctxMatches.filter(m => m.context.setpieceGoal       === true).length;
+    const momentum   = ctxMatches.filter(m => m.context.momentumShift      === true).length;
+    const subs       = ctxMatches.filter(m => m.context.madeSubstitutions  === true).length;
+
+    // ── Build readable fingerprint text for scout prompt injection ────────────
+    let fingerprintText = `CONFIRMED PLAYSTYLE PROFILE (based on ${n} verified match${n !== 1 ? 'es' : ''} this season):
+`;
+
+    if (formationEntries.length > 0) {
+      fingerprintText += `Formation: ${formationEntries.map(e => `${e.formation} (${e.pct}%)`).join(', ')}
+`;
+    } else {
+      fingerprintText += `Formation: No formation data (questionnaire not completed)
+`;
+    }
+
+    if (attackEntries.length > 0) {
+      fingerprintText += `Attack direction: ${attackEntries.map(e => `${e.direction === 'wings' ? 'Out Wide' : 'Through Middle'} (${e.pct}%)`).join(', ')}
+`;
+    } else {
+      fingerprintText += `Attack direction: No data
+`;
+    }
+
+    if (ctxMatches.length >= 2) {
+      fingerprintText += `Scores first: ${scoredFirst}/${ctxN} matches (${Math.round((scoredFirst/ctxN)*100)}%) -- ${scoredFirst >= ctxN*0.6 ? 'FRONT-LOADED STYLE' : scoredFirst <= ctxN*0.2 ? 'PLAYS FROM BEHIND' : 'balanced'}
+`;
+      fingerprintText += `Faces high press: ${pressing}/${ctxN} matches (${Math.round((pressing/ctxN)*100)}%)
+`;
+      fingerprintText += `Opponent sat back: ${defensive}/${ctxN} matches (${Math.round((defensive/ctxN)*100)}%)
+`;
+      fingerprintText += `Set piece goals: ${setpiece}/${ctxN} matches (${Math.round((setpiece/ctxN)*100)}%) -- ${setpiece >= ctxN*0.3 ? 'SET PIECE THREAT' : 'not a set piece scorer'}
+`;
+      fingerprintText += `Momentum shifts: ${momentum}/${ctxN} matches (${Math.round((momentum/ctxN)*100)}%) -- ${momentum >= ctxN*0.4 ? 'SECOND-HALF VULNERABILITY' : 'momentum-stable'}
+`;
+      fingerprintText += `Uses subs: ${subs}/${ctxN} matches (${Math.round((subs/ctxN)*100)}%) -- ${subs >= ctxN*0.6 ? 'ROTATION-DEPENDENT' : 'consistent lineup'}
+`;
+    } else {
+      fingerprintText += `Behavioural data: Insufficient questionnaire submissions (${ctxMatches.length} completed)
+`;
+    }
+
+    // ── Write to playerProfile collection ────────────────────────────────────
+    await db.collection('playerProfile').doc(playerId).set({
+      playerId,
+      seasonId,
+      matchCount: n,
+      formationEntries,
+      attackEntries,
+      tendencies: { pressing, defensive, scoredFirst, setpiece, momentum, subs, ctxN },
+      fingerprintText,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    console.log(`[CEE] Playstyle fingerprint updated: ${playerId} (${n} matches)`);
+  } catch(e) { console.error('[CEE] _buildPlaystyleFingerprint error:', e.message); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CEE INTELLIGENCE: _generateQuickAnalysis
+// Fires non-blocking after every verified screenshot submission.
+// PART A: Instant match analysis from extracted stats -- always generated.
+// PART B: Progressive tips comparing this match to player's previous match.
+// Both stored on fixture (quickAnalysisA/B) and served via GET /getQuickAnalysis.
+// Also writes to playerStatHistory for long-term per-player memory.
+// ═══════════════════════════════════════════════════════════════════════════
+async function _generateQuickAnalysis(playerId, fixtureId, fix, isHome, ai, myStats, matchContext) {
+  try {
+    const seasonId   = fix.seasonId || await getSeasonId();
+    const myGoals    = isHome ? (ai.homeGoals||0) : (ai.awayGoals||0);
+    const oppGoals   = isHome ? (ai.awayGoals||0) : (ai.homeGoals||0);
+    const result     = myGoals > oppGoals ? 'W' : myGoals < oppGoals ? 'L' : 'D';
+    const resultStr  = result === 'W' ? `Won ${myGoals}-${oppGoals}` : result === 'L' ? `Lost ${myGoals}-${oppGoals}` : `Drew ${myGoals}-${oppGoals}`;
+
+    const pdSnap     = await db.collection('players').doc(playerId).get();
+    const playerName = pdSnap.exists ? (pdSnap.data().clubName || pdSnap.data().gameName || 'Player') : 'Player';
+
+    const passAcc  = myStats.passes && myStats.passes > 0 && myStats.successfulPasses != null
+      ? Math.round((myStats.successfulPasses / myStats.passes) * 100) + '%' : 'N/A';
+    const shotQual = myStats.shots && myStats.shots > 0 && myStats.shotsOnTarget != null
+      ? Math.round((myStats.shotsOnTarget / myStats.shots) * 100) + '%' : 'N/A';
+
+    const statsBlock = `Match result: ${resultStr}
+Possession: ${myStats.possession != null ? myStats.possession+'%' : 'N/A'} | Shots: ${myStats.shots??'N/A'} (${myStats.shotsOnTarget??'?'} on target) | Shot quality: ${shotQual}
+Passes: ${myStats.passes??'N/A'} (${myStats.successfulPasses??'?'} successful) | Pass accuracy: ${passAcc}
+Tackles: ${myStats.tackles??'N/A'} | Interceptions: ${myStats.interceptions??'N/A'} | Saves: ${myStats.saves??'N/A'}
+Crosses: ${myStats.crosses??'N/A'} | Corners: ${myStats.cornerKicks??'N/A'} | Fouls: ${myStats.fouls??'N/A'} | Offsides: ${myStats.offsides??'N/A'}
+${matchContext ? `Formation: ${matchContext.formation||'unknown'} | Attack direction: ${matchContext.attackDirection||'unknown'}${matchContext.scoredFirst?' | Scored first':''}${matchContext.setpieceGoal?' | Set piece goal':''}${matchContext.momentumShift?' | Felt momentum shift':''}` : 'Post-match questionnaire: not completed this match'}`;
+
+    // ── Fetch previous match for progressive tips ──────────────────────────
+    let lastMatchBlock = '';
+    let hasLastMatch   = false;
+    let prevMatchDay   = '?';
+    try {
+      const prevSnap = await db.collection('matchStats')
+        .where('playerId', '==', playerId)
+        .where('seasonId', '==', seasonId)
+        .orderBy('verifiedAt', 'desc')
+        .limit(2)
+        .get();
+      if (prevSnap.size >= 2) {
+        const prev  = prevSnap.docs[1].data();
+        const ps    = prev.stats || {};
+        const pAcc  = ps.passes && ps.passes > 0 && ps.successfulPasses != null ? Math.round((ps.successfulPasses/ps.passes)*100)+'%' : 'N/A';
+        const pSQ   = ps.shots  && ps.shots  > 0 && ps.shotsOnTarget    != null ? Math.round((ps.shotsOnTarget/ps.shots)*100)+'%'    : 'N/A';
+        const pRes  = prev.result==='W' ? `Won ${prev.goalsFor}-${prev.goalsAgainst}` : prev.result==='L' ? `Lost ${prev.goalsFor}-${prev.goalsAgainst}` : `Drew ${prev.goalsFor}-${prev.goalsAgainst}`;
+        prevMatchDay = prev.matchDay || '?';
+        lastMatchBlock = `
+PREVIOUS MATCH (Match Day ${prev.matchDay||'?'}):
+Result: ${pRes}
+Possession: ${ps.possession!=null?ps.possession+'%':'N/A'} | Shots: ${ps.shots??'N/A'} (${ps.shotsOnTarget??'?'} on target) | Shot quality: ${pSQ}
+Passes: ${ps.passes??'N/A'} (${ps.successfulPasses??'?'} successful) | Pass accuracy: ${pAcc}
+Tackles: ${ps.tackles??'N/A'} | Interceptions: ${ps.interceptions??'N/A'} | Saves: ${ps.saves??'N/A'}
+${prev.context ? `Formation: ${prev.context.formation||'unknown'} | Attack: ${prev.context.attackDirection||'unknown'}` : ''}`;
+        hasLastMatch = true;
+      }
+    } catch(e2) { console.error('[CEE] quickAnalysis prev fetch:', e2.message); }
+
+    // ── Build prompt ──────────────────────────────────────────────────────────
+    const prompt = hasLastMatch ? `You are a personal eFootball coach reviewing a player's stats across recent matches. Here are their stats from their last match and their current match. Compare them directly. Tell the player: 1) What improved, 2) What got worse, 3) One specific thing to work on before their next match. Reference actual numbers. Be encouraging but honest. Maximum 12 lines.
+
+PLAYER: ${playerName}
+
+LAST MATCH (Match Day ${prevMatchDay}):
+${lastMatchBlock.trim()}
+
+CURRENT MATCH (Match Day ${fix.matchday||'?'}):
+${statsBlock}
+${matchContext ? `Post-match context: formation=${matchContext.formation||'?'}, attack=${matchContext.attackDirection||'?'}, scored first=${matchContext.scoredFirst===true?'yes':matchContext.scoredFirst===false?'no':'?'}, opp pressed=${matchContext.opponentPressing===true?'yes':matchContext.opponentPressing===false?'no':'?'}, opp sat back=${matchContext.opponentDefensive===true?'yes':matchContext.opponentDefensive===false?'no':'?'}, set piece goal=${matchContext.setpieceGoal===true?'yes':matchContext.setpieceGoal===false?'no':'?'}, momentum shift=${matchContext.momentumShift===true?'yes':matchContext.momentumShift===false?'no':'?'}, substitutions=${matchContext.madeSubstitutions===true?'yes':matchContext.madeSubstitutions===false?'no':'?'}, self-mistake=${matchContext.selfMistakeGoal===true?'yes':matchContext.selfMistakeGoal===false?'no':'?'}` : 'Post-match questionnaire: not completed'}`
+
+    : `You are a personal eFootball coach giving instant post-match feedback to ${playerName}.
+
+Here are their stats from their current match. Analyse what the numbers reveal about how the game was played — what worked, what didn't, and why the result happened. Reference actual numbers. Be encouraging but honest. Maximum 8 lines.
+
+Add one final line: "Answer the post-match questionnaire each match to unlock personalised improvement tips comparing your matches."
+
+CURRENT MATCH (Match Day ${fix.matchday||'?'}):
+${statsBlock}`;
+
+    // ── Gemini call ───────────────────────────────────────────────────────────
+    const gaRes = await _geminiPost({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 1200, temperature: 0.2 }
+    });
+    if (!gaRes.ok) { console.warn('[CEE] quickAnalysis Gemini failed:', gaRes.error); return; }
+
+    const text = (gaRes.data.candidates&&gaRes.data.candidates[0]&&gaRes.data.candidates[0].content&&gaRes.data.candidates[0].content.parts&&gaRes.data.candidates[0].content.parts[0]&&gaRes.data.candidates[0].content.parts[0].text) || '';
+    if (!text.trim()) return;
+
+    // ── Store on fixture ──────────────────────────────────────────────────────
+    const field = isHome ? 'quickAnalysisA' : 'quickAnalysisB';
+    await db.collection('fixtures').doc(fixtureId).update({
+      [field]: text.trim(),
+      [`${field}GeneratedAt`]: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // ── Write to playerStatHistory for long-term memory ───────────────────────
+    db.collection('playerStatHistory').doc(`${playerId}_${fixtureId}`).set({
+      playerId, seasonId, fixtureId,
+      matchDay:     fix.matchday    || null,
+      result, goalsFor: myGoals, goalsAgainst: oppGoals,
+      stats:        myStats,
+      context:      matchContext    || null,
+      quickAnalysis: text.trim(),
+      recordedAt:   admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true }).catch(e => console.error('[CEE] playerStatHistory write failed:', e.message));
+
+    console.log(`[CEE] Quick analysis generated for ${playerName} fixture ${fixtureId}`);
+  } catch(e) { console.error('[CEE] _generateQuickAnalysis error:', e.message); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /getQuickAnalysis?fixtureId=X&playerId=Y
+// Returns the quick match analysis + progressive tips for a player.
+// Called by frontend after submission — poll until success:true.
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/getQuickAnalysis', async (req, res) => {
+  const { fixtureId, playerId } = req.query;
+  if (!fixtureId || !playerId) return res.status(400).json({ success: false, message: 'Missing fields.' });
+  try {
+    const fixSnap = await db.collection('fixtures').doc(fixtureId).get();
+    if (!fixSnap.exists) return res.json({ success: false, message: 'Fixture not found.' });
+    const fix    = fixSnap.data();
+    const isHome = fix.playerAId === playerId;
+    const field  = isHome ? 'quickAnalysisA' : 'quickAnalysisB';
+    const text   = fix[field] || null;
+    const genAt  = fix[`${field}GeneratedAt`] ? fix[`${field}GeneratedAt`].toDate().toISOString() : null;
+    if (!text) return res.json({ success: false, reason: 'not_ready', message: 'Analysis is being generated. Check back in a moment.' });
+    return res.json({ success: true, analysis: text, generatedAt: genAt });
+  } catch(e) { return res.status(500).json({ success: false, message: e.message }); }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2829,18 +3163,123 @@ app.post('/approveRegistration', async (req, res) => {
     if (reg.status==='approved') return res.json({ success:false, message:'Already approved.' });
     const playerPin=pin||String(Math.floor(1000+Math.random()*9000));
     const pinHash=await bcrypt.hash(playerPin,12);
+
+    // ── Identity linking: find all previous player docs matching email or phone ──
+    // TIER 1: Check the fast returningPlayersMap (built at season transition) — one read.
+    // TIER 2: Fall back to collection queries (works even without a map, e.g. first season).
+    // This powers cross-season memory, integrity score continuity, and playstyle carry-forward.
+    const linkedPreviousPlayerIds = [];
+    let inheritedIntegrityScore   = 100;
+    let inheritedPlaystyleNote    = null;
+    try {
+      const emailKey = reg.email.toLowerCase().trim();
+      const cleanPhone = reg.phone ? String(reg.phone).replace(/\D/g, '') : null;
+      let foundViaMap = false;
+
+      // ── TIER 1: Fast returning players map lookup ─────────────────────────
+      const mapDoc = await db.collection('config').doc('returningPlayersMap').get();
+      if (mapDoc.exists) {
+        const map = mapDoc.data();
+        const byEmail = map.byEmail || {};
+        const byPhone = map.byPhone || {};
+        const foundIds = new Set();
+        if (byEmail[emailKey]) foundIds.add(byEmail[emailKey]);
+        if (cleanPhone && cleanPhone.length >= 8 && byPhone[cleanPhone]) foundIds.add(byPhone[cleanPhone]);
+        foundIds.forEach(id => {
+          if (!linkedPreviousPlayerIds.includes(id)) linkedPreviousPlayerIds.push(id);
+        });
+        if (linkedPreviousPlayerIds.length > 0) foundViaMap = true;
+      }
+
+      // ── TIER 2: Full collection query fallback ────────────────────────────
+      if (!foundViaMap) {
+        const linkQueries = [
+          db.collection('players').where('email', '==', emailKey).get()
+        ];
+        if (cleanPhone && cleanPhone.length >= 8) {
+          linkQueries.push(db.collection('players').where('phone', '==', cleanPhone).get());
+        }
+        const linkResults = await Promise.allSettled(linkQueries);
+        linkResults.forEach(result => {
+          if (result.status !== 'fulfilled') return;
+          result.value.forEach(d => {
+            if (d.data().seasonId !== seasonId && !linkedPreviousPlayerIds.includes(d.id)) {
+              linkedPreviousPlayerIds.push(d.id);
+            }
+          });
+        });
+      }
+      if (linkedPreviousPlayerIds.length > 0) {
+        // Find the most recent linked player (highest season number)
+        let mostRecentDoc = null;
+        for (const lid of linkedPreviousPlayerIds) {
+          const ld = await db.collection('players').doc(lid).get();
+          if (!ld.exists) continue;
+          const ldata = ld.data();
+          if (!mostRecentDoc ||
+              (ldata.seasonId || '').localeCompare(mostRecentDoc.seasonId || '') > 0) {
+            mostRecentDoc = ldata;
+          }
+        }
+        if (mostRecentDoc) {
+          // Carry forward integrity score — returning player keeps their record
+          if (mostRecentDoc.integrityScore != null) {
+            // Slight reset toward 100 between seasons (forgiveness factor)
+            // Score < 70 gets bumped to 70 as a season-grace reset, but not above
+            inheritedIntegrityScore = mostRecentDoc.integrityScore < 70
+              ? Math.min(70, mostRecentDoc.integrityScore + 10)
+              : mostRecentDoc.integrityScore;
+          }
+          // Build a note about returning player for admin awareness
+          const prevSeason = mostRecentDoc.seasonId || 'unknown season';
+          const prevTag    = mostRecentDoc.clubName || mostRecentDoc.gameName || 'unknown tag';
+          inheritedPlaystyleNote = `Returning player. Previously played as ${prevTag} in ${prevSeason}.`;
+          console.log(`[CEE] Identity link: ${reg.gameName} -> linked to ${linkedPreviousPlayerIds.length} prev player(s). Inherited integrity: ${inheritedIntegrityScore}`);
+        }
+      }
+    } catch(linkErr) {
+      console.error('[CEE] Identity linking error (non-fatal):', linkErr.message);
+    }
+
     const playerRef=await db.collection('players').add({
       seasonId, gameName:reg.gameName||'', clubName:reg.clubName||'',
       initials:reg.initials||(reg.gameName||'').substring(0,2).toUpperCase(),
       email:reg.email||'', telegramUsername:reg.telegramUsername||'',
+      phone: reg.phone ? String(reg.phone).replace(/\D/g,'') : null,
       telegramChatId:reg.telegramChatId||null, notificationsEmail:true, notificationsTelegram:true,
       registrationId:regId, legacyId:null,
       stats:{pts:0,mp:0,pld:0,w:0,d:0,l:0,gf:0,ga:0,gd:0,goals:0},
-      rank:null, knockoutStatus:null, createdAt:admin.firestore.FieldValue.serverTimestamp()
+      rank:null, knockoutStatus:null,
+      // Identity linking fields
+      linkedPreviousPlayerIds: linkedPreviousPlayerIds.length > 0 ? linkedPreviousPlayerIds : null,
+      integrityScore: inheritedIntegrityScore,
+      returningPlayer: linkedPreviousPlayerIds.length > 0,
+      returningPlayerNote: inheritedPlaystyleNote,
+      createdAt:admin.firestore.FieldValue.serverTimestamp()
     });
     await db.collection('playerSecrets').doc(playerRef.id).set(
       {pinHash,pinFailAttempts:0,pinLockoutUntil:null,pinLockoutCount:0});
     await regDoc.ref.update({status:'approved',playerId:playerRef.id,approvedAt:admin.firestore.FieldValue.serverTimestamp()});
+
+    // ── Update returningPlayersMap with this new player for future seasons ───────
+    // So the NEXT season can find this player via map lookup too
+    try {
+      const mapUpdate = {};
+      if (reg.email) mapUpdate[`byEmail.${reg.email.toLowerCase().trim()}`] = playerRef.id;
+      const cleanPhoneNew = reg.phone ? String(reg.phone).replace(/\D/g,'') : null;
+      if (cleanPhoneNew && cleanPhoneNew.length >= 8) mapUpdate[`byPhone.${cleanPhoneNew}`] = playerRef.id;
+      if (Object.keys(mapUpdate).length > 0) {
+        await db.collection('config').doc('returningPlayersMap').set(mapUpdate, { merge: true });
+      }
+    } catch(mapErr) { console.error('[CEE] returningPlayersMap update error (non-fatal):', mapErr.message); }
+
+    // Admin notification if returning player was found
+    if (linkedPreviousPlayerIds.length > 0) {
+      const adminChat = env.telegram && env.telegram.admin_chat_id;
+      if (adminChat) sendTelegram(adminChat,
+        `RETURNING PLAYER DETECTED\n${reg.gameName} (${reg.email})\nLinked to ${linkedPreviousPlayerIds.length} prev season player(s)\nInherited integrity score: ${inheritedIntegrityScore}/100\n${inheritedPlaystyleNote || ''}`
+      ).catch(()=>{});
+    }
     if (reg.email) {
       await sendEmail(reg.email,'CEE — Registration Approved 🎮',
         `<p>🎉 <strong>Your registration has been approved!</strong></p>
@@ -3016,7 +3455,7 @@ app.post('/startNewSeason', async (req, res) => {
     if (currentSeason.status !== 'complete')
       return res.json({ success:false, message:`Season must be marked "complete" before starting a new one. Current status: "${currentSeason.status}".` });
 
-    // --- Gather all data to archive ---
+    // ── Gather all data to archive ───────────────────────────────────────────────
     const [playersSnap, fixturesSnap, regsSnap, standingsSnap] = await Promise.all([
       db.collection('players').where('seasonId','==',currentId).get(),
       db.collection('fixtures').where('seasonId','==',currentId).get(),
@@ -3024,21 +3463,81 @@ app.post('/startNewSeason', async (req, res) => {
       db.collection('standingsBroadcast').doc(currentId).get()
     ]);
 
-    const players  = []; playersSnap.forEach(d  => players.push({ _id:d.id, ...d.data() }));
+    const players  = []; playersSnap.forEach(d => players.push({ _id:d.id, ...d.data() }));
     const fixtures = []; fixturesSnap.forEach(d => fixtures.push({ _id:d.id, ...d.data() }));
-    const regs     = []; regsSnap.forEach(d     => regs.push({ _id:d.id, ...d.data() }));
+    const regs     = []; regsSnap.forEach(d => regs.push({ _id:d.id, ...d.data() }));
     const standings = standingsSnap.exists ? standingsSnap.data().standings : [];
 
-    // --- Write archive document ---
+    // ── Gather intelligence data for archive ─────────────────────────────────
+    // playerProfile (playstyle fingerprints), scoutReports count, integrity scores
+    const playerIds = players.map(p => p._id);
+
+    // Fetch playstyle fingerprints for all players this season
+    const playstyleProfiles = {};
+    await Promise.allSettled(playerIds.map(async pid => {
+      const pd = await db.collection('playerProfile').doc(pid).get();
+      if (pd.exists) playstyleProfiles[pid] = pd.data();
+    }));
+
+    // Count scout reports and playerStatHistory entries
+    const [scoutReportsSnap, statHistorySnap] = await Promise.all([
+      db.collection('scoutReports').where('seasonId','==',currentId).get(),
+      db.collection('playerStatHistory').where('seasonId','==',currentId).get()
+    ]).catch(() => [{ size: 0 }, { size: 0 }]);
+
+    // Capture integrity scores from player docs
+    const integritySnapshot = {};
+    players.forEach(p => {
+      if (p.integrityScore != null) integritySnapshot[p._id] = p.integrityScore;
+    });
+
+    // ── Write comprehensive archive document ─────────────────────────────────
     await db.collection('seasons_archive').doc(currentId).set({
-      seasonId:    currentId,
-      seasonData:  currentSeason,
+      seasonId:         currentId,
+      seasonData:       currentSeason,
       players,
       fixtures,
-      registrations: regs,
-      finalStandings: standings,
-      archivedAt:  admin.firestore.FieldValue.serverTimestamp()
+      registrations:    regs,
+      finalStandings:   standings,
+      playstyleProfiles,
+      integritySnapshot,
+      intelligenceStats: {
+        scoutReports:    scoutReportsSnap.size || 0,
+        statHistoryDocs: statHistorySnap.size  || 0,
+      },
+      archivedAt: admin.firestore.FieldValue.serverTimestamp()
     });
+
+    // ── Build Returning Players Map ───────────────────────────────────────────
+    // A flat lookup map stored at config/returningPlayersMap so the next season's
+    // approveRegistration can find identity links with ONE read instead of
+    // expensive full-collection queries. Indexed by email and phone.
+    //
+    // Structure: { byEmail: { 'email@x.com': 'playerId' }, byPhone: { '0801...': 'playerId' } }
+    const byEmail = {};
+    const byPhone = {};
+    players.forEach(p => {
+      if (p.email) byEmail[p.email.toLowerCase().trim()] = p._id;
+      if (p.phone) {
+        const cleanPhone = String(p.phone).replace(/\D/g, '');
+        if (cleanPhone.length >= 8) byPhone[cleanPhone] = p._id;
+      }
+    });
+    // Also fold in previous seasons' maps (cumulative — links go back multiple seasons)
+    const existingMap = await db.collection('config').doc('returningPlayersMap').get();
+    if (existingMap.exists) {
+      const prev = existingMap.data();
+      if (prev.byEmail) Object.assign(byEmail, prev.byEmail); // existing entries kept, new ones added
+      if (prev.byPhone) Object.assign(byPhone, prev.byPhone);
+    }
+    await db.collection('config').doc('returningPlayersMap').set({
+      byEmail,
+      byPhone,
+      lastUpdatedSeason: currentId,
+      playerCount:       players.length,
+      updatedAt:         admin.firestore.FieldValue.serverTimestamp()
+    });
+    console.log(`[CEE] Returning players map built: ${Object.keys(byEmail).length} emails, ${Object.keys(byPhone).length} phones`);
 
     // --- Determine new season number ---
     const currentNum = parseInt((currentId.replace('season_','') || '1'), 10);
@@ -3063,7 +3562,8 @@ app.post('/startNewSeason', async (req, res) => {
     // --- Notify admin ---
     const adminChat  = env.telegram && env.telegram.admin_chat_id;
     const adminEmail = env.admin    && env.admin.email;
-    const summary = `Season ${currentNum} archived (${players.length} players, ${fixtures.length} fixtures).\nSeason ${newNum} created — status: Pending.\nOpen admin panel to configure registration dates and set status to Registration Open.`;
+    const returningCount = Object.keys(byEmail).length;
+    const summary = `Season ${currentNum} archived (${players.length} players, ${fixtures.length} fixtures, ${scoutReportsSnap.size||0} scout reports).\nReturning players map built: ${returningCount} identities tracked.\nSeason ${newNum} created — status: Pending.\nOpen admin panel to configure registration dates and set status to Registration Open.`;
     if (adminChat)  await sendTelegram(adminChat, `🎮 <b>New Season Started!</b>\n\n${summary}`).catch(()=>{});
     if (adminEmail) await sendEmail(adminEmail, `CEE — Season ${newNum} Created`,
       `<p>🎮 <strong>Season ${newNum} has been created.</strong></p>
@@ -4063,6 +4563,65 @@ app.post('/analyzeOpponent', async (req, res) => {
     oppMatchSnap.forEach(d => allOppMatches.push({ _id: d.id, ...d.data() }));
     const latestOppMatch = allOppMatches[allOppMatches.length - 1];
 
+    // ── D2: Hybrid Cross-Season Memory ───────────────────────────────────────────
+    // If opponent has < 3 matches this season, pull historical data so the scout
+    // report has real context instead of being near-empty.
+    //
+    // TIER 1 (Identity-Linked): Check oppPlayer.linkedPreviousPlayerIds first.
+    //   These are confirmed same-person matches from previous seasons, resolved by
+    //   email/phone identity matching at registration time. Most accurate.
+    //
+    // TIER 2 (Season Fallback): If no identity links found, fall back to fetching
+    //   matchStats by season number subtraction (season_N -> season_N-1).
+    //   Works for first-season setups before identity linking is populated.
+    //
+    // All historical matches are labelled [PREVIOUS SEASON DATA] in the prompt
+    // so Gemini weighs them as contextual background, not current-form data.
+    let prevSeasonMatches = [];
+    if (allOppMatches.length < 3) {
+      try {
+        const linkedIds = oppPlayer.linkedPreviousPlayerIds || [];
+
+        if (linkedIds.length > 0) {
+          // ── TIER 1: Identity-linked previous player IDs ───────────────────
+          // Fetch across all previous linked player IDs (handles multi-season gaps,
+          // tag changes, etc.) — up to 3 matches total, most recent first
+          const batchSize = Math.min(linkedIds.length, 10); // Firestore 'in' limit
+          const linkedSnap = await db.collection('matchStats')
+            .where('playerId', 'in', linkedIds.slice(0, batchSize))
+            .orderBy('verifiedAt', 'desc')
+            .limit(3)
+            .get();
+          linkedSnap.forEach(d => prevSeasonMatches.push({
+            _id: d.id, ...d.data(), _prevSeason: true, _linkMethod: 'identity'
+          }));
+          if (prevSeasonMatches.length > 0) {
+            console.log(`[CEE] D2 TIER-1: ${prevSeasonMatches.length} identity-linked prev matches for ${opponentPlayerId}`);
+          }
+        }
+
+        if (prevSeasonMatches.length === 0) {
+          // ── TIER 2: Season number fallback ────────────────────────────────
+          const currentSeasonNum = parseInt((seasonId.replace('season_', '') || '1'), 10);
+          if (currentSeasonNum > 1) {
+            const prevSeasonId = `season_${currentSeasonNum - 1}`;
+            const fallbackSnap = await db.collection('matchStats')
+              .where('playerId', '==', opponentPlayerId)
+              .where('seasonId', '==', prevSeasonId)
+              .orderBy('verifiedAt', 'desc')
+              .limit(3)
+              .get();
+            fallbackSnap.forEach(d => prevSeasonMatches.push({
+              _id: d.id, ...d.data(), _prevSeason: true, _linkMethod: 'season_fallback'
+            }));
+            if (prevSeasonMatches.length > 0) {
+              console.log(`[CEE] D2 TIER-2: ${prevSeasonMatches.length} season-fallback prev matches for ${opponentPlayerId}`);
+            }
+          }
+        }
+      } catch(prevErr) { console.error('[CEE] D2 cross-season fetch error:', prevErr.message); }
+    }
+
     // ── Cache check ─────────────────────────────────────────────────────────
     const reportDocId = `${requestingPlayerId}_${opponentPlayerId}_${seasonId}`;
     const cachedSnap = await db.collection('scoutReports').doc(reportDocId).get();
@@ -4090,12 +4649,14 @@ app.post('/analyzeOpponent', async (req, res) => {
     myMatchSnap.forEach(d => myMatches.push({ _id: d.id, ...d.data() }));
 
     // ── Fetch both player profiles ──────────────────────────────────────────
-    const [reqPlayerDoc, oppPlayerDoc] = await Promise.all([
+    const [reqPlayerDoc, oppPlayerDoc, oppProfileDoc] = await Promise.all([
       db.collection('players').doc(requestingPlayerId).get(),
-      db.collection('players').doc(opponentPlayerId).get()
+      db.collection('players').doc(opponentPlayerId).get(),
+      db.collection('playerProfile').doc(opponentPlayerId).get()
     ]);
-    const reqPlayer = reqPlayerDoc.exists ? { id: reqPlayerDoc.id, ...reqPlayerDoc.data() } : { id: requestingPlayerId, clubName: 'Unknown', gameName: 'Unknown', stats: {} };
-    const oppPlayer = oppPlayerDoc.exists ? { id: oppPlayerDoc.id, ...oppPlayerDoc.data() } : { id: opponentPlayerId, clubName: 'Unknown', gameName: 'Unknown', stats: {} };
+    const reqPlayer  = reqPlayerDoc.exists  ? { id: reqPlayerDoc.id,  ...reqPlayerDoc.data()  } : { id: requestingPlayerId, clubName: 'Unknown', gameName: 'Unknown', stats: {} };
+    const oppPlayer  = oppPlayerDoc.exists  ? { id: oppPlayerDoc.id,  ...oppPlayerDoc.data()  } : { id: opponentPlayerId, clubName: 'Unknown', gameName: 'Unknown', stats: {} };
+    const oppProfile = oppProfileDoc.exists ? oppProfileDoc.data() : null;
 
     // ── Use last 5 opponent matches ─────────────────────────────────────────
     const oppMatches = allOppMatches.slice(-5);
@@ -4110,7 +4671,12 @@ app.post('/analyzeOpponent', async (req, res) => {
       if (!m.fixtureId || !m.opponentId) return;
       try {
         const sideDoc = await db.collection('matchStats').doc(`${m.fixtureId}_${m.opponentId}`).get();
-        if (sideDoc.exists) oppSideStatsMap[m.fixtureId] = sideDoc.data().stats || {};
+        if (sideDoc.exists) {
+          oppSideStatsMap[m.fixtureId] = {
+            stats:   sideDoc.data().stats   || {},
+            context: sideDoc.data().context || {}
+          };
+        }
       } catch(e) { /* non-fatal: column stays -- */ }
     }));
 
@@ -4187,7 +4753,14 @@ app.post('/analyzeOpponent', async (req, res) => {
     const _trendGA = m => m.goalsAgainst != null ? m.goalsAgainst : null;
     const _trendPoss = m => (m.stats && m.stats.possession != null) ? m.stats.possession : null;
     const _trendShots = m => (m.stats && m.stats.shots != null) ? m.stats.shots : null;
-    const _trendInter = m => (m.stats && m.stats.interceptions != null) ? m.stats.interceptions : null;
+    const _trendInter   = m => (m.stats && m.stats.interceptions != null) ? m.stats.interceptions : null;
+    const _trendTackles = m => (m.stats && m.stats.tackles       != null) ? m.stats.tackles       : null;
+    const _trendSaves   = m => (m.stats && m.stats.saves         != null) ? m.stats.saves         : null;
+    const _trendCrosses = m => (m.stats && m.stats.crosses       != null) ? m.stats.crosses       : null;
+    const _trendFouls   = m => (m.stats && m.stats.fouls         != null) ? m.stats.fouls         : null;
+    const _trendOffsides= m => (m.stats && m.stats.offsides      != null) ? m.stats.offsides      : null;
+    const _trendCorners = m => (m.stats && m.stats.cornerKicks   != null) ? m.stats.cornerKicks   : null;
+    const _trendFKs     = m => (m.stats && m.stats.freeKicks     != null) ? m.stats.freeKicks     : null;
 
     // Split matches into early (first half) and recent (second half) for trajectory
     const trendMid = Math.ceil(oppMatches.length / 2);
@@ -4240,6 +4813,38 @@ app.post('/analyzeOpponent', async (req, res) => {
     const recentShots   = _trendAvg(trendRecent, _trendShots);
     const earlyInter    = _trendAvg(trendEarly,  _trendInter);
     const recentInter   = _trendAvg(trendRecent, _trendInter);
+    const earlyTackles  = _trendAvg(trendEarly,  _trendTackles);
+    const recentTackles = _trendAvg(trendRecent, _trendTackles);
+    const earlySaves    = _trendAvg(trendEarly,  _trendSaves);
+    const recentSaves   = _trendAvg(trendRecent, _trendSaves);
+    const earlyCrosses  = _trendAvg(trendEarly,  _trendCrosses);
+    const recentCrosses = _trendAvg(trendRecent, _trendCrosses);
+    const earlyFouls    = _trendAvg(trendEarly,  _trendFouls);
+    const recentFouls   = _trendAvg(trendRecent, _trendFouls);
+    const earlyOffsides = _trendAvg(trendEarly,  _trendOffsides);
+    const recentOffsides= _trendAvg(trendRecent, _trendOffsides);
+    const earlyCorners  = _trendAvg(trendEarly,  _trendCorners);
+    const recentCorners = _trendAvg(trendRecent, _trendCorners);
+    const earlyFKs      = _trendAvg(trendEarly,  _trendFKs);
+    const recentFKs     = _trendAvg(trendRecent, _trendFKs);
+
+    // ── Behavioural patterns from questionnaire data ──────────────────────────
+    const _ctxCount = (field) => oppMatches.filter(m => m.context && m.context[field] === true).length;
+    const scoredFirstCount   = _ctxCount('scoredFirst');
+    const setpieceGoalCount  = _ctxCount('setpieceGoal');
+    const momentumShiftCount = _ctxCount('momentumShift');
+    const subsCount          = _ctxCount('madeSubstitutions');
+    const selfMistakeCount   = _ctxCount('selfMistakeGoal');
+    const _bp = oppMatches.length;
+    const _pct = (n) => _bp > 0 ? `${n}/${_bp} matches` : 'No data';
+    const behaviouralPatterns = [
+      scoredFirstCount   >= Math.ceil(_bp*0.6) ? `Scores first in ${_pct(scoredFirstCount)} -- front-loaded game style, aggressive in opening phases` :
+      scoredFirstCount   <= Math.floor(_bp*0.2) && _bp >= 3 ? `Rarely scores first (${_pct(scoredFirstCount)}) -- often plays from behind, may sit back early` : null,
+      setpieceGoalCount  >= 2 ? `Set piece goals in ${_pct(setpieceGoalCount)} -- dangerous from free kicks and corners, defend them tightly` : null,
+      momentumShiftCount >= 2 ? `Momentum shifts felt in ${_pct(momentumShiftCount)} -- second half vulnerability detected, press harder when leading` : null,
+      selfMistakeCount   >= 2 ? `Self-mistake goals in ${_pct(selfMistakeCount)} -- error-prone under pressure, press high and force mistakes` : null,
+      subsCount          >= Math.ceil(_bp*0.6) ? `Uses substitutions in ${_pct(subsCount)} -- rotation-dependent, watch for mid-game formation changes` : null,
+    ].filter(Boolean);
 
     // Weighted overall form score (recent matches count double)
     const oppAllGoalsFor = oppMatches.map(_trendGF).filter(v => v !== null);
@@ -4274,10 +4879,20 @@ STATISTICAL TRAJECTORY (Early matches → Recent matches):
   \${_trendDir('Shot quality',          earlyShotQ,   recentShotQ,   'SHOT QUALITY RATIO %',  true)}
   \${_trendDir('Possession',            earlyPoss,    recentPoss,    'POSSESSION %',          true)}
   \${_trendDir('Shots per match',       earlyShots,   recentShots,   'SHOTS/MATCH',           true)}
-  \${_trendDir('Interceptions/match',   earlyInter,   recentInter,   'INTERCEPTIONS/MATCH',   true)}
+  ${_trendDir('Interceptions/match',   earlyInter,   recentInter,   'INTERCEPTIONS/MATCH',   true)}
+  ${_trendDir('Tackles/match',         earlyTackles, recentTackles, 'TACKLES/MATCH',         true)}
+  ${_trendDir('Saves/match',           earlySaves,   recentSaves,   'SAVES/MATCH',           false)}
+  ${_trendDir('Crosses/match',         earlyCrosses, recentCrosses, 'CROSSES/MATCH',         true)}
+  ${_trendDir('Fouls/match',           earlyFouls,   recentFouls,   'FOULS/MATCH',           false)}
+  ${_trendDir('Offsides/match',        earlyOffsides,recentOffsides,'OFFSIDES/MATCH',        false)}
+  ${_trendDir('Corners/match',         earlyCorners, recentCorners, 'CORNERS/MATCH',         true)}
+  ${_trendDir('Free kicks/match',      earlyFKs,     recentFKs,     'FREE KICKS/MATCH',      false)}
 
-FORMATION PATTERN: \${formationStability}
-TACTICAL TREND:    \${tacticalTrend}
+FORMATION PATTERN: ${formationStability}
+TACTICAL TREND:    ${tacticalTrend}
+
+BEHAVIOURAL PATTERNS (from post-match questionnaire data):
+${behaviouralPatterns.length > 0 ? behaviouralPatterns.map(b => '  * ' + b).join('\n') : '  * Insufficient questionnaire data -- players have not completed post-match questions'}
 
 INTERPRETATION RULES FOR TREND DATA:
 - ↑ IMPROVING in goals scored + ↑ shot quality = player is peaking — treat as current threat level
@@ -4286,6 +4901,13 @@ INTERPRETATION RULES FOR TREND DATA:
 - COLD STREAK opponent may be desperate — higher risk of erratic play or tactical changes
 - Formation variety = adaptable player; rigid formation = predictable but potentially optimised
 - Increasing defensiveness (tactical trend) = they may be protecting a lead or lacking confidence
+- TACKLES trending up = defending more, likely sitting deeper or under sustained pressure
+- SAVES trending up = goalkeeper overworked = your attacks creating real danger, keep attacking
+- CROSSES trending up = exploiting wide areas = pack the box, use aerial presence
+- FOULS trending up = frustration or reckless pressing = set pieces are a real threat
+- OFFSIDES trending up = running a high defensive line = through balls and runs in behind will hurt them
+- CORNERS trending up = dominant wide play = strong aerial game, be physical at set pieces
+- Behavioural patterns marked * are derived from player post-match questionnaire submissions
 ════════════════════════════════════════════════════════════════`;
 
     // ── eFootball Mechanics knowledge base ─────────────────────────────────
@@ -4370,7 +4992,9 @@ CONDITION CHECK:
         : '—';
 
       // INTEL-05 FIX: pull opponent-side stats from oppSideStatsMap (fetched above)
-      const os = oppSideStatsMap[m.fixtureId] || {};
+      const oppSide = oppSideStatsMap[m.fixtureId] || {};
+      const os   = oppSide.stats   || {};
+      const octx = oppSide.context || {};
       const oppPassAcc = (os.passes && os.successfulPasses)
         ? Math.round((os.successfulPasses / os.passes) * 100) + '%'
         : '—';
@@ -4416,14 +5040,56 @@ MATCH ${idx+1} OF ${matchesAnalysed} — Match Day ${m.matchDay||'?'} — Result
   Momentum shift felt : ${ctx.momentumShift === true ? 'yes [MOMENTUM-POSSIBLE elevated to CONFIRMED]' : ctx.momentumShift === false ? 'no' : 'unknown'}
   Made substitutions  : ${ctx.madeSubstitutions === true ? 'yes' : ctx.madeSubstitutions === false ? 'no' : 'unknown'}
   Self-mistake goal   : ${ctx.selfMistakeGoal === true ? 'yes' : ctx.selfMistakeGoal === false ? 'no' : 'unknown'}
+
+  [OPPONENT CONTEXT for this match -- from their post-match questionnaire]
+  Opponent formation  : ${octx.formation || 'unknown'}
+  Opponent attack dir : ${octx.attackDirection === 'wings' ? 'Out Wide (wings)' : octx.attackDirection === 'middle' ? 'Center Attack (middle)' : 'unknown'}
+  Opponent pressed    : ${octx.opponentPressing  === true ? 'yes -- likely Frontline Pressure or Aggressive' : octx.opponentPressing  === false ? 'no' : 'unknown'}
+  Opponent sat back   : ${octx.opponentDefensive === true ? 'yes -- likely Deep Line or Possession Trap'     : octx.opponentDefensive === false ? 'no' : 'unknown'}
 `;
     });
+
+    // ── D2: Append previous season match tables if fetched ───────────────────────
+    if (prevSeasonMatches.length > 0) {
+      matchTables += `
+[PREVIOUS SEASON DATA -- ${prevSeasonMatches[0]&&prevSeasonMatches[0]._linkMethod==='identity' ? 'identity-verified returning player' : 'same-ID previous season'} -- use as background context; current season data limited to ${allOppMatches.length} match${allOppMatches.length !== 1 ? 'es' : ''}]
+`;
+      prevSeasonMatches.forEach((m, idx) => {
+        const s   = m.stats   || {};
+        const ctx = m.context || {};
+        const passAcc  = (s.passes && s.successfulPasses) ? Math.round((s.successfulPasses/s.passes)*100)+'%' : '—';
+        const shotQual = (s.shots  && s.shotsOnTarget)    ? Math.round((s.shotsOnTarget/s.shots)*100)+'%'     : '—';
+        matchTables += `
+────────────────────────────────────────────────────────────────
+PREV SEASON MATCH ${idx+1} — Match Day ${m.matchDay||'?'} — Result: ${m.result||'?'} (${m.goalsFor||0}–${m.goalsAgainst||0}) [PREVIOUS SEASON]
+────────────────────────────────────────────────────────────────
+
+  My Team: ${oppPlayer.clubName}   Score: ${m.goalsFor||0} – ${m.goalsAgainst||0}   [Previous Season]
+
+  Stat                | My Team  | Opponent
+  --------------------|----------|----------
+  Possession          | ${fmtN(s.possession)}%     | ${fmtN(100-(s.possession||0))}%
+  Shots               | ${fmtN(s.shots)}        | —
+  Shots on Target     | ${fmtN(s.shotsOnTarget)}        | —
+  Passes              | ${fmtN(s.passes)}        | —
+  Successful Passes   | ${fmtN(s.successfulPasses)}        | —
+  Interceptions       | ${fmtN(s.interceptions)}        | —
+  Tackles             | ${fmtN(s.tackles)}        | —
+
+  Pass Accuracy       : ${passAcc}
+  Shot Quality Ratio  : ${shotQual}
+  Formation           : ${ctx.formation || 'unknown'}
+  Attack direction    : ${ctx.attackDirection || 'unknown'}
+`;
+      });
+    }
 
     // ── Section 9 personalisation anchor (Section 8 = Trend Verdict) ──────────
     const section8Anchor = `════════════════════════════════════════════════════════════════
 PLAYER TIER & CONTEXT — READ BEFORE WRITING ANY SECTION
 ════════════════════════════════════════════════════════════════
 
+${oppProfile && oppProfile.fingerprintText ? oppProfile.fingerprintText + '\n' : ''}
 REQUESTING PLAYER  : ${reqPlayer.clubName} (${reqPlayer.gameName})
   Tier             : ${reqTierLabel}
   Formation        : ${myFormation}
@@ -4585,7 +5251,7 @@ MATCH ANALYSIS:
 `;
     const _gr2 = await _geminiPost({
       contents: [{ parts: [{ text: upgradeSubPrompt + reportText }] }],
-      generationConfig: { maxOutputTokens: 5000, temperature: 0 }
+      generationConfig: { maxOutputTokens: 8000, temperature: 0 }
     });
     const upgradeText = (_gr2.ok && _gr2.data.candidates&&_gr2.data.candidates[0]&&_gr2.data.candidates[0].content&&_gr2.data.candidates[0].content.parts&&_gr2.data.candidates[0].content.parts[0]&&_gr2.data.candidates[0].content.parts[0].text) || '';
     return res.json({ success: true, upgradeText });
@@ -4926,7 +5592,7 @@ app.post('/testAiVerify', async (req, res) => {
           { inline_data: { mime_type: mimeType || 'image/jpeg', data: screenshotBase64 } },
           { text: 'This is a screenshot from an eFootball video game. Read the final score and team names from the results screen.\nRespond ONLY in JSON with no markdown:\n{\n  "isEfootballResultScreen": true/false,\n  "isFullResultScreen": true/false,\n  "homeGoals": <integer or null>,\n  "awayGoals": <integer or null>,\n  "homeClubName": "<string or null>",\n  "awayClubName": "<string or null>",\n  "isPlausibleScore": true/false,\n  "imageQualityScore": <float 0.0-1.0>,\n  "uiMatchScore": <float 0.0-1.0>,\n  "readingIssues": [],\n  "statAnomalies": [],\n  "confidence": <float 0.0-1.0>\n}\nNotes:\n- isPlausibleScore: false only if goal difference >= 10 or either score > 20\n- imageQualityScore: how clearly the image can be read (1.0 = perfect)\n- uiMatchScore: how closely this matches a real eFootball results screen\n- readingIssues: list any parts of the screen that were hard to read\n- confidence: overall certainty all values are correct' }
         ]}],
-        generationConfig: { maxOutputTokens:5000, temperature: 0 }
+        generationConfig: { maxOutputTokens:8000, temperature: 0 }
       });
     if (!_gr3.ok) throw new Error(_gr3.error || 'Gemini Vision call failed');
     const rawText = (_gr3.data.candidates&&_gr3.data.candidates[0]&&_gr3.data.candidates[0].content&&_gr3.data.candidates[0].content.parts&&_gr3.data.candidates[0].content.parts[0]&&_gr3.data.candidates[0].content.parts[0].text) || '';
