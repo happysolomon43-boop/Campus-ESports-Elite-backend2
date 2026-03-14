@@ -2697,7 +2697,9 @@ app.get('/adminGenerateVapidKeys', (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/vapidPublicKey', (req, res) => {
   if (!VAPID_PUBLIC_KEY) return res.json({ ok: false, message: 'Web push not configured on this server.' });
-  res.json({ ok: true, publicKey: VAPID_PUBLIC_KEY });
+  // Strip whitespace/quotes in case key was pasted with extra chars in Railway
+  const cleanKey = VAPID_PUBLIC_KEY.replace(/[\s"']/g, '').trim();
+  res.json({ ok: true, publicKey: cleanKey });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
