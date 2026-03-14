@@ -4767,14 +4767,17 @@ app.post('/analyzeOpponent', async (req, res) => {
     const trendEarly  = oppMatches.slice(0, trendMid);
     const trendRecent = oppMatches.slice(trendMid);
 
-    const _trendDir = (earlyVal, recentVal, label, higherIsBetter = true) => {
+    const _trendDir = (_shortLabel, earlyVal, recentVal, label, higherIsBetter = true) => {
       if (earlyVal === null || recentVal === null) return `${label}: Insufficient data`;
-      const diff = recentVal - earlyVal;
-      const pct  = earlyVal !== 0 ? Math.round(Math.abs(diff) / earlyVal * 100) : 0;
-      if (Math.abs(diff) < 0.5) return `${label}: Stable (${recentVal.toFixed(1)})`;
+      const eNum = typeof earlyVal === 'number' ? earlyVal : parseFloat(earlyVal);
+      const rNum = typeof recentVal === 'number' ? recentVal : parseFloat(recentVal);
+      if (isNaN(eNum) || isNaN(rNum)) return `${label}: Insufficient data`;
+      const diff = rNum - eNum;
+      const pct  = eNum !== 0 ? Math.round(Math.abs(diff) / Math.abs(eNum) * 100) : 0;
+      if (Math.abs(diff) < 0.5) return `${label}: Stable (${rNum.toFixed(1)})`;
       const improving = higherIsBetter ? diff > 0 : diff < 0;
       const arrow = improving ? '↑ IMPROVING' : '↓ DECLINING';
-      return `${label}: ${arrow} ${earlyVal.toFixed(1)} → ${recentVal.toFixed(1)} (${pct}% shift)`;
+      return `${label}: ${arrow} ${eNum.toFixed(1)} → ${rNum.toFixed(1)} (${pct}% shift)`;
     };
 
     // Results sequence for streak analysis
