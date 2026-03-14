@@ -5129,27 +5129,14 @@ Every fix in the upgrade plan must be actionable for ${reqPlayer.clubName} speci
       return res.json({ success: false, reason: 'ai_unavailable', message: 'Analysis engine is temporarily unavailable. Please try again shortly.' });
     }
 
-    // ── Call 2 — Tactical Upgrade Engine ────────────────────────────────────
-    try {
-      const _gr2 = await _geminiPost({
-          contents: [{ parts: [{ text: upgradeSubPrompt + reportText }] }],
-          generationConfig: { maxOutputTokens:5000, temperature: 0 }
-        });
-      if (_gr2.ok) {
-        upgradeText = (_gr2.data.candidates&&_gr2.data.candidates[0]&&_gr2.data.candidates[0].content&&_gr2.data.candidates[0].content.parts&&_gr2.data.candidates[0].content.parts[0]&&_gr2.data.candidates[0].content.parts[0].text) || '';
-      }
-    } catch(e2) {
-      console.error('[CEE] analyzeOpponent Call 2 error:', e2.message);
-      upgradeText = ''; // Non-fatal — report is still returned without upgrade plan
-    }
-
-    // ── Cache the report ────────────────────────────────────────────────────
+    // ── Cache the report (Call 2 / upgrade plan fetched separately by frontend) ──
+    const upgradeText = ''; // frontend calls /analyzeOpponentUpgrade separately
     const reportDoc = {
       requestingPlayerId, opponentPlayerId, seasonId,
       generatedAt: admin.firestore.FieldValue.serverTimestamp(),
       opponentLastMatchId: latestOppMatch._id,
       reportText,
-      upgradeText,
+      upgradeText: '',
       matchesAnalysed,
       opponentName: oppPlayer.clubName || oppPlayer.gameName || 'Unknown'
     };
