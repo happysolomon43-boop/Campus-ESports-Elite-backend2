@@ -117,6 +117,41 @@ function _geminiUrl(k) {
   return `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${k.key}`;
 }
 
+// ── Gemini 2.5 Pro — used ONLY for scout analysis (large context text tasks) ─
+// Flash is kept for all other calls (vision/fraud detection, small tasks).
+// Pro handles the 5-match stat dump + trend report context reliably.
+function _geminiProUrl(k) {
+  return `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${k.key}`;
+}
+
+async function _geminiProPost(bodyObj) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < Math.max(_geminiKeys.length, 1); attempt++) {
+    const k = _pickGeminiKey();
+    if (!k) return { ok: false, error: 'All Gemini keys hit their quota for today. Add more via GEMINI_KEY_2/3/4 in Railway.' };
+    try {
+      const r = await fetch(_geminiProUrl(k), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(bodyObj)
+      });
+      k.callsToday++;
+      if (r.status === 429) {
+        k.exhausted = true;
+        lastErr = 'quota_exceeded';
+        console.warn(`[CEE] Gemini Pro key #${_geminiKeys.indexOf(k)+1} exhausted (429) after ${k.callsToday} calls today — rotating`);
+        continue;
+      }
+      const data = await r.json();
+      return { ok: true, data };
+    } catch(e) {
+      lastErr = e.message;
+      console.error(`[CEE] Gemini Pro call error (attempt ${attempt+1}):`, e.message);
+    }
+  }
+  return { ok: false, error: lastErr || 'Gemini Pro call failed' };
+}
+
 // Wrapper: pick key, call Gemini, rotate on 429, retry with next key automatically
 async function _geminiPost(bodyObj) {
   let lastErr = null;
@@ -4255,720 +4290,68 @@ INTERPRETATION RULES FOR TREND DATA:
 
     // ── eFootball Mechanics knowledge base ─────────────────────────────────
     // ── eFootball Analysis Engine v2 (5 Phases + Tactical Upgrade Sub-Prompt) ─
-    const ANALYSIS_ENGINE_V2 = `╔══════════════════════════════════════════════════════════════╗
-║   eFOOTBALL MOBILE — DEEP MATCH ANALYSIS ENGINE v2          ║
-║   Phase 1: Orientation & Mental Model Construction          ║
-╚══════════════════════════════════════════════════════════════╝
+    const ANALYSIS_ENGINE_V2 = `You are an expert eFootball Mobile scout analyst. Analyse the match statistics below and produce a SCOUTING REPORT with exactly these 9 sections. Be sharp, specific, and ground every finding in eFootball mechanics (attacking styles, defensive styles, sliders, player roles).
 
-You are an elite eFootball Mobile analyst with expert knowledge
-of the game's mechanics — attacking/defensive styles, mentality
-sliders, player roles, the momentum system, and how stat lines
-reflect in-game behavior.
+SECTION 1 — MATCH SNAPSHOT
+2-3 sentences. What style did each team run? Was the result earned or fortunate?
 
-Your task: perform a deep, eFootball-grounded analysis of the
-match statistics provided. Every finding must tie directly to
-how eFootball Mobile actually works.
-
-────────────────────────────────────────────────────────────────
-READ EVERYTHING BEFORE WRITING ANYTHING
-────────────────────────────────────────────────────────────────
-
-Before producing any output, build your mental model:
-
-  STEP 1 — READ THE SCORE
-  · What did each team need from this match?
-  · Does the scoreline reflect statistical dominance?
-  · Identify immediately: did the efficient team win or the
-    dominant team?
-
-  STEP 2 — CLASSIFY EACH TEAM'S LIKELY SETUP
-  Based on the stats, infer which eFootball attacking style
-  each team was running. Use these benchmarks:
-
-    Possession Game   → High passes, high pass accuracy (85%+),
-                        low direct shots, few crosses
-    Counter Attack    → Low possession, low passes, high shots
-                        from limited possesion, fast transitions
-    Long Ball Counter → Very low passes, low pass accuracy,
-                        high free kicks (winning fouls high up)
-    Out Wide          → High crosses (2+), wide shot angles,
-                        higher corner count
-    Center Attack     → High successful passes in tight areas,
-                        low crosses, shots from central zones
-
-  STEP 3 — CLASSIFY DEFENSIVE SHAPE
-  Infer each team's defensive style from:
-
-    Deep Defensive Line → High interceptions (sitting back),
-                          low tackles (waiting, not pressing),
-                          opponent has more possession
-    Frontline Pressure  → High tackles, opponent low pass
-                          accuracy (disrupted build-up)
-    Aggressive          → Very high interceptions + tackles
-                          combined, higher fouls possible
-    Possession Trap     → Opponent forced wide, low central
-                          shot attempts, high interceptions
-
-  STEP 4 — FLAG ZERO STATS AS TACTICAL SIGNALS
-  In eFootball, a zero is never neutral. Treat every zero as
-  a deliberate or forced tactical condition:
-
-    Crosses = 0     → Wing play was absent or completely shut down.
-                      Either Center Attack style, or opponent
-                      successfully forced play inside.
-    Corners = 0     → Never reached final third effectively, OR
-                      defense was too compact to concede corners.
-    Offsides = 0    → Either very disciplined runs, or no runs
-                      in behind at all (Deep-Lying Forward, no
-                      Goal Poacher making blind-side runs).
-
-  Complete this model silently. Then begin your report.
-
-════════════════════════════════════════════════════════════════
-
-╔══════════════════════════════════════════════════════════════╗
-║   eFOOTBALL MOBILE — DEEP MATCH ANALYSIS ENGINE v2          ║
-║   Phase 2: Active Investigation Rules                       ║
-╚══════════════════════════════════════════════════════════════╝
-
-Apply ALL six rules to every stat without exception.
-
-────────────────────────────────────────────────────────────────
-RULE 1 — SHOT QUALITY IS THE ONLY ATTACKING TRUTH
-────────────────────────────────────────────────────────────────
-
-  In eFootball, shots are not equal. Shot quality depends on:
-  · Body position when shooting
-  · Distance from goal
-  · Pressure from defenders (affects finesse shot accuracy)
-  · Player's Finishing and Kicking Power stats
-  · Player form condition at match time
-
-  Therefore: DO NOT judge attack on shot volume alone.
-  Calculate: Shots on Target ÷ Total Shots = Shot Quality Ratio
-
-    ≥ 0.60  → Clinical, well-constructed chances
-    0.40–0.59 → Decent but with wasted attempts
-    < 0.40  → Shooting from poor positions, likely under pressure
-             or using the wrong shot type for the situation
-
-  Flag any team with high shots but low on-target ratio as
-  likely running an aggressive/counter style without the player
-  quality to finish from range.
-
-────────────────────────────────────────────────────────────────
-RULE 2 — PASS ACCURACY REVEALS THE ATTACKING STYLE DIRECTLY
-────────────────────────────────────────────────────────────────
-
-  Calculate pass accuracy: Successful Passes ÷ Total Passes
-
-  Then map it against eFootball's attacking styles:
-
-    ≥ 88%  → Possession Game confirmed or probable
-    78–87% → Controlled build-up, likely Center Attack
-    65–77% → Transitional, Counter or Long Ball elements
-    < 65%  → Long Ball Counter, or build-up under heavy pressure
-             from opponent's Frontline Pressure / Aggressive defense
-
-  CRITICAL: If the team with LOWER pass accuracy scored MORE,
-  this is a direct indicator they are running Counter Attack
-  or Long Ball Counter successfully — punishing on transitions.
-
-────────────────────────────────────────────────────────────────
-RULE 3 — INTERCEPTIONS vs TACKLES = DEFENSIVE SHAPE SIGNATURE
-────────────────────────────────────────────────────────────────
-
-  These two stats together define the defensive strategy:
-
-    High INT, Low TKL  → Deep Defensive Line or Possession Trap
-                         Waiting, reading passing lanes, not
-                         engaging until the ball arrives.
-
-    High TKL, Low INT  → Frontline Pressure or Aggressive style.
-                         Winning ball through physical challenge,
-                         not positioning.
-
-    High INT + High TKL → Aggressive style confirmed. High risk.
-                          Check fouls — if fouls are ALSO high,
-                          the press broke down and conceded set pieces.
-
-    Low INT + Low TKL  → Either the team had the ball all match
-                         (no need to defend), or defensive shape
-                         completely collapsed (check shots conceded).
-
-────────────────────────────────────────────────────────────────
-RULE 4 — CROSSES REVEAL WIDTH INSTRUCTIONS
-────────────────────────────────────────────────────────────────
-
-  In eFootball, crosses happen when:
-  · Attacking Width slider is set high (7–10)
-  · Out Wide attacking style is active
-  · Wingers have Prolific Winger or similar wide roles
-  · The player chose to cross instead of cut inside
-
-  Crosses = 0 means one of:
-    A) Team plays narrow by design (Center Attack, low width)
-    B) Winger roles are set to cut inside (Prolific Winger)
-    C) Opponent's compact defensive shape blocked wide channels
-
-  Crosses ≥ 3 = team is actively using width as a weapon.
-  Measure: did those crosses lead to shots? If crosses are high
-  but shots are low, the delivery or striker movement failed.
-
-────────────────────────────────────────────────────────────────
-RULE 5 — SAVES ARE A GOALKEEPER WORKLOAD MEASUREMENT
-────────────────────────────────────────────────────────────────
-
-  In eFootball, goalkeepers with high GK Awareness, Reflexes,
-  and Reach stats can single-handedly alter match outcomes.
-
-  Interpret saves in context:
-
-    0 saves, 0 shots faced  → Clean sheet was never threatened.
-                              Dominant defensive performance.
-    0 saves, 1+ shots faced → Opponent missed everything.
-                              Attack was inaccurate, not defended.
-    1+ saves on 3+ shots    → Goalkeeper was decisive. Rate their
-                              performance as match-deciding.
-    Saves = Goals conceded  → Every shot that hit target went in.
-                              Either poor keeper stats or
-                              exceptional finishing from opponent.
-
-────────────────────────────────────────────────────────────────
-RULE 6 — ACCOUNT FOR THE MOMENTUM SYSTEM
-────────────────────────────────────────────────────────────────
-
-  eFootball has a known momentum shift mechanic. After a goal,
-  the opponent AI often surges — interceptions spike, passing
-  windows close, your players slow down.
-
-  When interpreting stats, flag any pattern that suggests a
-  momentum-driven stat cluster:
-  · Opponent's interceptions significantly higher than tackles
-    → May indicate an AI-driven surge period, not pure tactics
-  · Your pass accuracy dropped despite similar possession
-    → Could reflect mid-match momentum shift closing passing lanes
-  · High opponent shots in a short statistical window
-    → Classic post-goal AI surge behavior
-
-  Label these findings as: [MOMENTUM-POSSIBLE] — acknowledge
-  it without certifying, since the system is not confirmed
-  officially by Konami. Let the player decide.
-
-════════════════════════════════════════════════════════════════
-
-╔══════════════════════════════════════════════════════════════╗
-║   eFOOTBALL MOBILE — DEEP MATCH ANALYSIS ENGINE v2          ║
-║   Phase 3: Analysis Lens — What to Cover                    ║
-╚══════════════════════════════════════════════════════════════╝
-
-Analyze ALL seven dimensions. State "not determinable" only
-after active reasoning against every available stat.
-
-────────────────────────────────────────────────────────────────
-[ DIMENSION 1 — ATTACKING SYSTEM DIAGNOSIS ]
-────────────────────────────────────────────────────────────────
-
-  Identify the most likely attacking style each team ran.
-  Provide EVIDENCE from the stats — not a guess.
-
-  Then assess: was it executed well?
-  · Possession Game → Did they convert possession into shots?
-  · Counter Attack → Did they score or threaten from limited touches?
-  · Long Ball Counter → Were direct balls actually reaching targets?
-    (Low pass acc + shots = yes. Low pass acc + low shots = no)
-  · Out Wide → Did crosses lead to anything dangerous?
-  · Center Attack → Were central passing combinations creating shots?
-
-  Rate execution: SUCCESSFUL / PARTIALLY EFFECTIVE / FAILED
-
-────────────────────────────────────────────────────────────────
-[ DIMENSION 2 — DEFENSIVE STRUCTURE DIAGNOSIS ]
-────────────────────────────────────────────────────────────────
-
-  Identify the most likely defensive style each team ran.
-  Check: was the defensive line appropriate for their attack style?
-
-  CRITICAL INTERACTION IN eFOOTBALL:
-  · High Defensive Line + Aggressive Press → Effective against
-    Possession teams but DESTROYED by manual through balls
-  · Deep Defensive Line → Compact, but if opponent plays wide
-    (Out Wide style), can be exposed by driven crosses
-  · Possession Trap → Forces wide play, works if you have
-    physical wingers with strong defensive stats
-
-  Flag any dangerous combination:
-  · Aggressive defense + opponent had 3+ successful through-ball
-    indicators (shots 1v1 style, low crosses, offsides) = exploited
-  · Deep line + high opponent crosses = aerial threat not addressed
-
-────────────────────────────────────────────────────────────────
-[ DIMENSION 3 — POSSESSION QUALITY ]
-────────────────────────────────────────────────────────────────
-
-  Possession % + Pass Accuracy together = possession quality score
-
-  Map to eFootball slider context:
-  · If possession is high AND pass accuracy is high (85%+):
-    High Support Range + Possession Game = patient build-up working
-  · If possession is high BUT pass accuracy is low (under 78%):
-    Team is holding the ball under pressure — their Compactness
-    slider may be too low, leaving midfield isolated
-  · If possession is low BUT shots are equal or better:
-    Counter Attack or Long Ball Counter working as designed.
-    DO NOT penalize this team for low possession.
-
-────────────────────────────────────────────────────────────────
-[ DIMENSION 4 — PLAYER ROLE INFERENCE ]
-────────────────────────────────────────────────────────────────
-
-  From stats alone, infer what player roles were likely active:
-
-  High interceptions from one side → Anchor Man or Destroyer
-    in the midfield was doing their job
-  0 crosses but shots came from wide zones → Prolific Winger
-    (cuts inside to shoot rather than crossing)
-  Low shots despite high possession → No Goal Poacher or the
-    striker was playing Deep-Lying Forward (dropping to link play
-    rather than making box runs)
-  Very low offsides → Either no Hole Player making runs in behind,
-    or the forward role is dropping deep (Orchestrator/DLF type)
-
-  Label these as [ROLE INFERENCE] — they are educated readings,
-  not confirmed without formation/lineup data.
-
-────────────────────────────────────────────────────────────────
-[ DIMENSION 5 — SET PIECE & TRANSITION INDICATORS ]
-────────────────────────────────────────────────────────────────
-
-  Free Kicks → Reflect how many times a team was fouled, or
-    how aggressively the opponent was defending. High free kicks
-    on one side = opponent was pressing desperately, committing
-    fouls to stop transitions.
-
-  Corners → In eFootball, corners come from defensive clearances
-    under wing pressure. 0 corners for a team playing Out Wide
-    suggests the attack reached wide areas but crosses were cut
-    out cleanly before hitting the byline.
-
-  Offsides → Reveals striker behavior. If offsides are high:
-    Goal Poacher or a forward making aggressive blind-side runs.
-    Possibly the Attacking Mentality slider is too high, pushing
-    the striker to make early runs before the ball is played.
-
-────────────────────────────────────────────────────────────────
-[ DIMENSION 6 — RESULT FAIRNESS VS eFOOTBALL EFFICIENCY ]
-────────────────────────────────────────────────────────────────
-
-  Use all stats together to judge whether the scoreline was just.
-
-  Build a DOMINANCE SCORE for each team (0–10):
-  · +2 if shot on target ratio ≥ 0.60
-  · +2 if pass accuracy ≥ 80%
-  · +1 if interceptions > opponent's interceptions
-  · +1 if tackles > opponent's tackles
-  · +2 if shots on target > opponent
-  · +1 if possession > 52%
-  · +1 if crosses led to shots (crosses ≥ 1 AND shots on target ≥ 2)
-
-  Compare dominance scores. If a team scores but has a lower
-  dominance score, label them: FORTUNATE WINNER.
-  If a team loses with higher dominance: UNLUCKY LOSER.
-
-────────────────────────────────────────────────────────────────
-[ DIMENSION 7 — eFOOTBALL ANOMALY CHECK ]
-────────────────────────────────────────────────────────────────
-
-  These specific patterns suggest game engine behavior,
-  not player tactics. Flag them clearly:
-
-  · AI interceptions significantly spike relative to tackles
-    → Possible momentum system activation [MOMENTUM-POSSIBLE]
-  · Very low fouls but very high tackles
-    → AI opponent using aggressive contain + second press
-      mechanic extremely efficiently (common vs AI difficulty)
-  · Shots on target for one team = 0 despite 3+ total shots
-    → Shots being taken from poor body positions under pressure;
-      suggests player instruction to shoot early is active
-  · Saves = 0 on 1+ shots
-    → Either GK stats were very high, or shots were off target
-      (covered in shots on target stat — verify consistency)
-
-════════════════════════════════════════════════════════════════
-
-────────────────────────────────────────────────────────────────
-[ DIMENSION 8 — TREND ANALYSIS & FORM TRAJECTORY ]
-────────────────────────────────────────────────────────────────
-
-  A TREND ANALYSIS block is provided above the match tables.
-  This is pre-calculated trajectory data — READ IT CAREFULLY.
-
-  Use it to answer:
-  · Is this opponent getting BETTER or WORSE as the season progresses?
-  · Is their pass accuracy rising (improving build-up) or falling?
-  · Is their shot quality improving (more clinical) or declining?
-  · Are they on a hot streak or cold streak — and what does that mean
-    psychologically for how they will approach this match?
-
-  CRITICAL RULE — Trending data overrides flat averages:
-  · If their pass accuracy average is 75% but the trend shows
-    ↑ IMPROVING from 70% → 82%, treat them as an 82% pass accuracy
-    team in current form — the average understates the real threat.
-  · If their shot quality is ↓ DECLINING, their attack is becoming
-    less efficient — their average may overstate the real threat.
-
-  Label trend-based findings as [TREND-CONFIRMED] when the
-  trajectory supports the conclusion across 2+ matches.
-  Label as [SINGLE-MATCH — VERIFY] if only one data point shifts.
-
-  Connect form streak to psychology:
-  · HOT STREAK → Expect high-pressing, confident, risk-taking play
-  · COLD STREAK → Expect conservative, possibly desperate — exploit
-    by staying patient and drawing them out of shape
-
-════════════════════════════════════════════════════════════════
-
-╔══════════════════════════════════════════════════════════════╗
-║   eFOOTBALL MOBILE — DEEP MATCH ANALYSIS ENGINE v2          ║
-║   Phase 4: Report Structure                                 ║
-╚══════════════════════════════════════════════════════════════╝
-
-Produce your analysis using EXACTLY this eight-section structure.
-Do not reorder, merge, or skip any section.
-
-────────────────────────────────────────────────────────────────
-SECTION 1 — MATCH SNAPSHOT  (2–3 sentences)
-────────────────────────────────────────────────────────────────
-  A sharp summary of the match's character. Name the dominant
-  style you inferred for each team. Capture whether the result
-  was earned or stolen.
-
-────────────────────────────────────────────────────────────────
 SECTION 2 — STAT-BY-STAT BREAKDOWN
-────────────────────────────────────────────────────────────────
-  For every stat provided, give:
-  · The raw numbers
-  · What they reveal in eFootball mechanical context
-  · Which team this stat favors and why
-  Include calculated ratios: pass accuracy %, shot quality %.
+For every stat: raw numbers, what it means in eFootball, which team it favours. Calculate pass accuracy % and shot quality ratio (shots on target ÷ shots).
 
-────────────────────────────────────────────────────────────────
 SECTION 3 — ATTACKING SYSTEM VERDICT
-────────────────────────────────────────────────────────────────
-  For each team:
-  · Inferred attacking style (with stat evidence)
-  · Execution rating: SURGICAL / EFFICIENT / WASTEFUL / TOOTHLESS
-  · What the attack did well and where it broke down
+Each team: inferred attacking style with stat evidence. Execution rating: SURGICAL / EFFICIENT / WASTEFUL / TOOTHLESS.
 
-────────────────────────────────────────────────────────────────
 SECTION 4 — DEFENSIVE SYSTEM VERDICT
-────────────────────────────────────────────────────────────────
-  For each team:
-  · Inferred defensive style (with stat evidence)
-  · Defense rating: FORTRESS / DISCIPLINED / LEAKY / EXPOSED
-  · Any dangerous matchup between their defense and the
-    opponent's attacking style — flag exploitation risks
+Each team: inferred defensive style with stat evidence. Rating: FORTRESS / DISCIPLINED / LEAKY / EXPOSED. Flag any dangerous matchup.
 
-────────────────────────────────────────────────────────────────
-SECTION 5 — POSSESSION QUALITY ASSESSMENT
-────────────────────────────────────────────────────────────────
-  · Pass accuracy for both teams (calculated)
-  · Whether possession was productive or sterile
-  · How the Support Range and Compactness sliders likely
-    contributed to the passing picture
+SECTION 5 — POSSESSION QUALITY
+Pass accuracy for both teams. Was possession productive or sterile? What sliders likely contributed?
 
-────────────────────────────────────────────────────────────────
 SECTION 6 — DOMINANCE SCORE & RESULT FAIRNESS
-────────────────────────────────────────────────────────────────
-  Show the Dominance Score calculation for both teams.
-  Deliver one of these verdicts:
-    RESULT REFLECTS PLAY
-    RESULT SLIGHTLY FLATTERS [Team]
-    RESULT GREATLY FLATTERS [Team] — UNLUCKY LOSER DETECTED
-  Justify with specific stat references.
+Score each team 0-10 using: +2 shot quality ≥60%, +2 pass accuracy ≥80%, +1 more interceptions, +1 more tackles, +2 more shots on target, +1 possession >52%, +1 crosses led to shots. Verdict: RESULT REFLECTS PLAY / RESULT FLATTERS [team] / UNLUCKY LOSER DETECTED.
 
-────────────────────────────────────────────────────────────────
-SECTION 7 — KEY TACTICAL INSIGHTS  (4–6 bullet points)
-────────────────────────────────────────────────────────────────
-  The most important strategic observations.
-  Each point must reference a specific stat AND a specific
-  eFootball mechanic (style, slider, player role, or system).
+SECTION 7 — KEY TACTICAL INSIGHTS
+4-6 bullet points. Each must reference a specific stat AND a specific eFootball mechanic.
 
-────────────────────────────────────────────────────────────────
 SECTION 8 — TREND VERDICT & FORM READING
-────────────────────────────────────────────────────────────────
-  Using the TREND ANALYSIS block provided:
-  · State whether the opponent is improving, declining, or stable
-    across each key metric — reference specific trajectory numbers
-  · Give a FORM RATING: PEAK FORM / GOOD FORM / INCONSISTENT / OUT OF FORM
-  · Name the 2 biggest trend risks: what is this opponent getting
-    better at that the requesting player must counter?
-  · Name 1 exploit: what is declining that can be targeted?
+Using the TREND DATA provided: is opponent improving/declining/stable? FORM RATING: PEAK / GOOD / INCONSISTENT / OUT OF FORM. Name 2 biggest trend risks and 1 exploit.
 
-────────────────────────────────────────────────────────────────
-SECTION 9 — WHAT TO ADJUST  (For the player's team)
-────────────────────────────────────────────────────────────────
-  Concrete eFootball-specific adjustments tied to real settings:
+SECTION 9 — WHAT TO ADJUST (for the requesting player's team)
+Minimum 3 adjustments in this format:
+PROBLEM → [stat finding]
+CAUSE → [likely eFootball setting]
+FIX → [exact setting: style name, slider value 1-10, player role, or formation]
 
-  FORMAT each adjustment as:
-    PROBLEM   → [what the stats revealed]
-    CAUSE     → [likely eFootball setting or role contributing]
-    FIX       → [exact setting change: style, slider value,
-                 formation tweak, or player role adjustment]
-
-  Minimum 3 adjustments. Maximum 6. No generic football advice.
-  Every fix must be something you can literally change inside
-  eFootball Mobile's team management screen.
-
-════════════════════════════════════════════════════════════════
-
-╔══════════════════════════════════════════════════════════════╗
-║   eFOOTBALL MOBILE — DEEP MATCH ANALYSIS ENGINE v2          ║
-║   Phase 5: Evidence Standards & Final Instruction           ║
-╚══════════════════════════════════════════════════════════════╝
-
-────────────────────────────────────────────────────────────────
-BEFORE STATING ANY FINDING, VERIFY ALL OF THE FOLLOWING:
-────────────────────────────────────────────────────────────────
-
-  ✓ You used the actual stat number provided — not assumed it
-  ✓ You cross-referenced it with at least one related stat
-  ✓ You considered whether the pattern could be mechanical
-    (momentum system) vs tactical (player instruction)
-  ✓ You calculated the relevant ratio (pass acc, shot quality)
-  ✓ You connected the finding to an eFootball mechanic by name
-  ✓ You distinguished between what is DEFINITIVE and INFERRED
-
-────────────────────────────────────────────────────────────────
-UNCERTAINTY LABELING SYSTEM
-────────────────────────────────────────────────────────────────
-
-  Use these labels when certainty cannot be confirmed from stats:
-
-  [INFERRED]          — Reasonable tactical conclusion, but would
-                        need lineup/formation data to confirm
-  [MOMENTUM-POSSIBLE] — Pattern matches eFootball's momentum
-                        system behavior; cannot confirm without
-                        live match footage
-  [REQUIRES CONTEXT]  — Finding depends on information not
-                        present in the stat line (e.g., player
-                        form conditions, specific player roles)
-
-────────────────────────────────────────────────────────────────
-TONE STANDARDS
-────────────────────────────────────────────────────────────────
-
-  · Write as a sharp eFootball analyst, not a commentator
-  · Use eFootball vocabulary: pressing triggers, defensive line,
-    attacking width, support range, player roles by name
-  · Every sentence must carry mechanical meaning — no filler
-  · Be direct about which team played better and why
-  · Do not celebrate the winner automatically — if they were
-    fortunate, say so with evidence
-
-────────────────────────────────────────────────────────────────
-FINAL INSTRUCTION
-────────────────────────────────────────────────────────────────
-
-  Work through all phases in order.
-  The most revealing findings are often in the LOSING team's
-  stats — a team can statistically outplay their opponent and
-  still lose due to poor shot conversion or momentum shifts.
-  Find that story if it exists. Name it directly.
-
-  Do not produce a partial report.
-  Do not stop at the obvious surface observations.
-
-════════════════════════════════════════════════════════════════
-  [PASTE YOUR eFOOTBALL MATCH STATISTICS BELOW THIS LINE]
-════════════════════════════════════════════════════════════════
-
-  My Team: ___________________   Score: ___ – ___
-  Opponent: __________________
-
-  Stat                | My Team | Opponent
-  --------------------|---------|----------
-  Possession          |         |
-  Shots               |         |
-  Shots on Target     |         |
-  Fouls               |         |
-  Offsides            |         |
-  Corner Kicks        |         |
-  Free Kicks          |         |
-  Passes              |         |
-  Successful Passes   |         |
-  Crosses             |         |
-  Interceptions       |         |
-  Tackles             |         |
-  Saves               |         |
-
-  [OPTIONAL — helps improve analysis accuracy]
-  My Attacking Style  : ___________________________
-  My Defensive Style  : ___________________________
-  My Formation        : ___________________________
-
-════════════════════════════════════════════════════════════════`;
-
+[MATCH DATA BELOW]
+[PASTE YOUR eFOOTBALL MATCH STATISTICS BELOW THIS LINE]`
     // ── Tactical Upgrade Engine v2 (Sub-Prompt) ──────────────────────────────
-    const UPGRADE_ENGINE_V2 = `╔══════════════════════════════════════════════════════════════╗
-║   eFOOTBALL MOBILE — TACTICAL UPGRADE ENGINE                ║
-║   Sub-Prompt: Convert Analysis Into Actionable Fixes        ║
-╚══════════════════════════════════════════════════════════════╝
+    const UPGRADE_ENGINE_V2 = `You are an eFootball Mobile tactical coach. Based on the scouting report below, produce a TACTICAL UPGRADE PLAN.
 
-You have completed the match analysis above.
-Now activate the Tactical Upgrade Engine.
+Every recommendation must reference a real eFootball setting: attacking style, defensive style, slider value (1-10), player role name, or formation.
 
-Your task: take every weakness, inefficiency, and finding from
-the analysis and convert it into a PRECISE improvement plan
-that maps directly to eFootball Mobile's adjustable settings.
+FORMAT:
+┌─────────────────────────────────────────┐
+│  TACTICAL UPGRADE PLAN                  │
+└─────────────────────────────────────────┘
 
-────────────────────────────────────────────────────────────────
-CORE PRINCIPLE
-────────────────────────────────────────────────────────────────
+PRIORITY FIXES (do before next match):
+① [Most critical — exact setting + value]
+② [Second fix]  
+③ [Third fix]
 
-  Every recommendation MUST reference a real eFootball setting:
-  · An Attacking Style (Possession Game, Counter, Long Ball,
-    Out Wide, Center Attack)
-  · A Defensive Style (Deep Line, Frontline Pressure,
-    Aggressive, Possession Trap)
-  · A Slider (Attacking Width, Defensive Line, Compactness,
-    Support Range — suggest a target value 1–10)
-  · A Player Role (Goal Poacher, Prolific Winger, Anchor Man,
-    Destroyer, Hole Player, Box-to-Box, Orchestrator, etc.)
-  · A Formation Change (e.g., 4-3-3 → 4-2-3-1 to add midfield
-    screen, or asymmetric attack/defend formation)
-  · A Player Instruction (individual player role swap or
-    out-of-position flag check)
+SECONDARY ADJUSTMENTS:
+· [Fine-tuning adjustment]
+· [Fine-tuning adjustment]
 
-  Recommendations not tied to an actual eFootball setting
-  are INVALID and must be discarded.
+IN-MATCH TRIGGERS:
+· If [situation] → [specific setting change]
+· If [situation] → [specific setting change]
 
-────────────────────────────────────────────────────────────────
-FIX CATEGORIES — ADDRESS EACH APPLICABLE ONE
-────────────────────────────────────────────────────────────────
+CONDITION CHECK:
+· [Position] — only start on gold/green form
+· [Position] — bench if yellow/red form
 
-  [ A ] ATTACKING STYLE ALIGNMENT
-  ─────────────────────────────────
-  Was the team's attacking style suited to their stats?
-  · If pass accuracy was too low for Possession Game → recommend
-    switching to Center Attack or Counter Attack
-  · If crosses led to nothing → recommend shifting from Out Wide
-    to Center Attack, OR increasing striker's aerial stats
-  · If shots were wasteful → recommend style switch that creates
-    higher quality positions (Possession Game for better angles)
-
-  [ B ] DEFENSIVE STYLE ALIGNMENT
-  ─────────────────────────────────
-  Was the defensive style creating or hiding vulnerabilities?
-  · If interceptions were low and shots conceded were high
-    → consider shifting from Aggressive to Frontline Pressure
-    or Deep Defensive Line depending on opponent's attack pattern
-  · If the opponent ran Counter Attack successfully
-    → recommend lowering Attacking Width slider (reduce exposure)
-    and switching to Deep Defensive Line when leading
-
-  [ C ] SLIDER ADJUSTMENTS
-  ─────────────────────────────────
-  Recommend specific slider values for next match based on:
-
-    ATTACKING WIDTH
-    · Was play too narrow? → Increase to 7–8
-    · Was the team exposed on counters? → Decrease to 4–5
-
-    DEFENSIVE LINE
-    · Were through balls getting through? → Lower to 4–5
-    · Was compactness breaking too easily? → Lower to 3–4
-    · Need to press high and win ball quickly? → Raise to 7–8
-
-    COMPACTNESS
-    · Was midfield too easily bypassed? → Increase to 7–8
-    · Are transitions slow because players are too bunched? → 5–6
-
-    SUPPORT RANGE
-    · Striker isolated from midfield support? → Increase to 6–7
-    · Build-up was fine but final third lacked movement? → 7–8
-
-  [ D ] PLAYER ROLE ADJUSTMENTS
-  ─────────────────────────────────
-  From the stat inference in the analysis, identify role mismatches:
-
-  · No shots from wide = switch Prolific Winger role to confirm
-    it's set for cut-inside behavior, not crossing
-  · No runs in behind = add a Goal Poacher or set a Hole Player
-    to make late runs into the box
-  · Midfield overrun = verify Anchor Man is present and not
-    replaced by two offensive midfielders
-  · Link-up play failing = consider a Deep-Lying Forward or
-    Orchestrator to drop and create passing triangles
-
-  [ E ] FORMATION RESPONSE
-  ─────────────────────────────────
-  Based on how the opponent attacked, recommend a formation tweak:
-
-  · Against heavy crossing (high opponent crosses):
-    → 5-3-2 or 4-5-1 to pack the wide channels
-  · Against Counter Attack opponent (you had more possession
-    but they threatened on transitions):
-    → 4-2-3-1 with two defensive mids to screen
-  · Against Central Attack opponent (everything came through middle):
-    → Tighter compactness slider + Destroyer role in midfield
-
-  [ F ] IN-MATCH MANAGEMENT PROTOCOL
-  ─────────────────────────────────
-  Based on the match script, suggest when adjustments should be
-  made DURING the game (not just at setup):
-
-  · If you score first → When to switch to Deep Defensive Line
-    and drop Defensive Line slider to protect the lead
-  · If you go behind → When to push Attacking Width slider up
-    and switch to Possession Game to maintain control
-  · If momentum shifts detected → Suggest a sub + formation
-    tweak timed to reset the game state
-
-  [ G ] PLAYER CONDITION PRIORITY
-  ─────────────────────────────────
-  Remind the player:
-  · Player form arrows (gold/green/yellow/red) apply a hidden
-    stat multiplier — a red-form Finishing player will miss
-    shots a gold-form player converts
-  · For the next match, prioritize starting players currently
-    showing gold or green condition arrows in key positions:
-    Striker (Finishing), Central Mid (Vision/Low Pass),
-    Goalkeeper (Reflexes/GK Awareness)
-
-────────────────────────────────────────────────────────────────
-OUTPUT FORMAT FOR SUB-PROMPT
-────────────────────────────────────────────────────────────────
-
-  Produce the improvement plan in this format:
-
-  ┌─────────────────────────────────────────────────────────┐
-  │  TACTICAL UPGRADE PLAN — [Match Result]                 │
-  └─────────────────────────────────────────────────────────┘
-
-  PRIORITY FIXES (Address before next match):
-  ① [Most critical fix — style/slider/role + exact value]
-  ② [Second fix]
-  ③ [Third fix]
-
-  SECONDARY ADJUSTMENTS (For fine-tuning):
-  · [Adjustment 1]
-  · [Adjustment 2]
-
-  IN-MATCH TRIGGERS:
-  · If [situation] → [specific adjustment]
-  · If [situation] → [specific adjustment]
-
-  CONDITION CHECK REMINDER:
-  · [Position] — start only on gold/green form next match
-  · [Position] — bench if on yellow/red form
-
-  ────────────────────────────────────────────────────────
-  Keep every recommendation specific, mechanical, and
-  grounded in what eFootball Mobile actually allows you
-  to change. No generic advice. No vague suggestions.
-  ────────────────────────────────────────────────────────`;
-
+[PASTE YOUR eFOOTBALL MATCH STATISTICS BELOW THIS LINE]`
     // ── Build prompt blocks ─────────────────────────────────────────────────
     // Block 4: Requesting player context
     // ── Build stats table for each opponent match ─────────────────────────
@@ -5110,12 +4493,12 @@ Opponent scouted  : ${oppPlayer.clubName} | Matches analysed: ${matchesAnalysed}
 Every fix in the upgrade plan must be actionable for ${reqPlayer.clubName} specifically.
 `;
 
-    // ── Call 1 — Main Analysis ──────────────────────────────────────────────
+    // ── Call 1 — Main Analysis (uses Gemini Pro for large context) ──────────────────────────────────────────
     let reportText = '';
     try {
-      const _gr1 = await _geminiPost({
+      const _gr1 = await _geminiProPost({
           contents: [{ parts: [{ text: fullPrompt }] }],
-          generationConfig: { maxOutputTokens:5000, temperature: 0 }
+          generationConfig: { maxOutputTokens:8000, temperature: 0 }
         });
       if (!_gr1.ok) throw new Error(_gr1.error || 'Gemini Call 1 failed');
       reportText = (_gr1.data.candidates&&_gr1.data.candidates[0]&&_gr1.data.candidates[0].content&&_gr1.data.candidates[0].content.parts&&_gr1.data.candidates[0].content.parts[0]&&_gr1.data.candidates[0].content.parts[0].text) || '';
@@ -5200,7 +4583,7 @@ Opponent scouted: ${opponentName || 'unknown'} | Matches analysed: ${matchesAnal
 
 MATCH ANALYSIS:
 `;
-    const _gr2 = await _geminiPost({
+    const _gr2 = await _geminiProPost({
       contents: [{ parts: [{ text: upgradeSubPrompt + reportText }] }],
       generationConfig: { maxOutputTokens: 5000, temperature: 0 }
     });
