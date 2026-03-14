@@ -3979,9 +3979,12 @@ db.collection('registrations').onSnapshot(snapshot => {
 // Implements caching: report is reused until opponent plays a new match.
 // ═══════════════════════════════════════════════════════════════════════════
 app.post('/analyzeOpponent', async (req, res) => {
-  // Extend timeout to 120s — this endpoint makes 2 large Gemini calls
-  req.setTimeout(120000);
-  res.setTimeout(120000);
+  // Disable nginx proxy buffering so Railway doesn't drop long responses
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Keep-Alive', 'timeout=180');
+  req.socket.setKeepAlive(true, 10000);
+  req.socket.setTimeout(0); // disable socket timeout entirely for this endpoint
   const { requestingPlayerId, opponentPlayerId, seasonId, fixtureId } = req.body;
   if (!requestingPlayerId || !opponentPlayerId || !seasonId) {
     return res.status(400).json({ success: false, message: 'Missing required fields.' });
@@ -5173,6 +5176,53 @@ Every fix in the upgrade plan must be actionable for ${reqPlayer.clubName} speci
   } catch(e) {
     console.error('[CEE] analyzeOpponent error:', e.message);
     return res.status(500).json({ success: false, message: 'Server error: ' + e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /analyzeOpponentUpgrade — Call 2 only (Tactical Upgrade Plan)
+// Called separately after /analyzeOpponent to avoid Railway timeout
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/analyzeOpponentUpgrade', async (req, res) => {
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.setHeader('Connection', 'keep-alive');
+  req.socket.setKeepAlive(true, 10000);
+  req.socket.setTimeout(0);
+  const { reportText, requestingPlayerName, opponentName, myFormation, myAttackDir, myAvgPassAcc, matchesAnalysed } = req.body;
+  if (!reportText) return res.status(400).json({ success: false, message: 'Missing reportText' });
+  try {
+    const upgradeSubPrompt = `You are an eFootball Mobile tactical coach.
+Based on the match analysis report below, produce a TACTICAL UPGRADE PLAN with specific eFootball settings changes.
+
+FORMAT:
+PRIORITY FIXES (before next match):
+① [Fix 1 — style/slider/role + exact value]
+② [Fix 2]
+③ [Fix 3]
+
+SECONDARY ADJUSTMENTS:
+· [Adjustment 1]
+· [Adjustment 2]
+
+IN-MATCH TRIGGERS:
+· If [situation] → [specific adjustment]
+
+Every recommendation must reference a real eFootball setting (attacking style, defensive style, slider value 1-10, player role name, or formation).
+
+Requesting player: ${requestingPlayerName || 'unknown'} | Formation: ${myFormation || 'unknown'} | Attack: ${myAttackDir || 'unknown'} | Avg pass acc: ${myAvgPassAcc || 'N/A'}
+Opponent scouted: ${opponentName || 'unknown'} | Matches analysed: ${matchesAnalysed || '?'}
+
+MATCH ANALYSIS:
+`;
+    const _gr2 = await _geminiPost({
+      contents: [{ parts: [{ text: upgradeSubPrompt + reportText }] }],
+      generationConfig: { maxOutputTokens: 5000, temperature: 0 }
+    });
+    const upgradeText = (_gr2.ok && _gr2.data.candidates&&_gr2.data.candidates[0]&&_gr2.data.candidates[0].content&&_gr2.data.candidates[0].content.parts&&_gr2.data.candidates[0].content.parts[0]&&_gr2.data.candidates[0].content.parts[0].text) || '';
+    return res.json({ success: true, upgradeText });
+  } catch(e) {
+    console.error('[CEE] analyzeOpponentUpgrade error:', e.message);
+    return res.json({ success: false, upgradeText: '', message: e.message });
   }
 });
 
