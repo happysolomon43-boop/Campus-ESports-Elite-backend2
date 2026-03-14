@@ -311,12 +311,12 @@ const app = express();
 app.options('*', corsMidd({
   origin: '*',
   methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','x-cee-admin-secret']
+  allowedHeaders: ['Content-Type','x-cee-admin-secret','x-cee-player-pin']
 }));
 app.use(corsMidd({
   origin: '*',
   methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','x-cee-admin-secret']
+  allowedHeaders: ['Content-Type','x-cee-admin-secret','x-cee-player-pin']
 }));
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
