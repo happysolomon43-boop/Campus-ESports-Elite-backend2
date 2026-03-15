@@ -5848,6 +5848,7 @@ Respond ONLY in JSON, no markdown, no preamble:
 
     // ── Calculate for all fixtures ────────────────────────────────────────
     const results = [];
+    let aiInsightCount = 0; // cap AI calls to protect Gemini quota
     for (const doc of fixturesSnap) {
       const f   = doc.data ? doc.data() : doc;
       const fid = doc.id;
@@ -5857,9 +5858,12 @@ Respond ONLY in JSON, no markdown, no preamble:
 
       const prob = _calcProbability(pidA, pidB);
 
-      // AI tactical insight — only for fixtures with sufficient data, non-blocking
+      // AI tactical insight — only for PENDING upcoming fixtures with sufficient data
+      // Cap at 10 calls per request to protect Gemini quota
       let tacticalInsight = null;
-      if (prob.sufficient) {
+      const isPending = !f.status || f.status === 'pending' || f.status === 'open';
+      if (prob.sufficient && isPending && aiInsightCount < 10) {
+        aiInsightCount++;
         tacticalInsight = await _aiTacticalInsight(pidA, pidB, prob).catch(() => null);
       }
 
