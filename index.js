@@ -3301,12 +3301,16 @@ app.post('/approveRegistration', async (req, res) => {
       console.error('[CEE] Identity linking error (non-fatal):', linkErr.message);
     }
 
-    // Auto-assign pot based on squad strength (submitted in registration form)
+    // Auto-assign pot based on real eFootball 2026 squad strength tiers
+    // P1: 3250+ (top 5-10%, Big Time/Epic Booster cards)
+    // P2: 3150+ (standard competitive, the 3150 average)
+    // P3: 3000+ (developing, below average)
+    // P4: <3000  (new player / themed / authentic squad)
     const regStrength = Number(reg.strength) || 0;
     const autoPot = reg.pot ? Number(reg.pot) :
-      regStrength >= 3100 ? 1 :
-      regStrength >= 2900 ? 2 :
-      regStrength >= 2700 ? 3 : 4;
+      regStrength >= 3250 ? 1 :
+      regStrength >= 3150 ? 2 :
+      regStrength >= 3000 ? 3 : 4;
 
     const playerRef=await db.collection('players').add({
       seasonId, gameName:reg.gameName||'', clubName:reg.clubName||'',
@@ -4166,7 +4170,7 @@ setInterval(async () => {
         const seasonId = reg.seasonId;
         const regStrength = Number(reg.strength) || 0;
         const cfgDoc = await db.collection('config').doc('automation').get();
-        const thresh = (cfgDoc.exists && cfgDoc.data().potThresholds) || { p1:3100, p2:2900, p3:2700 };
+        const thresh = (cfgDoc.exists && cfgDoc.data().potThresholds) || { p1:3250, p2:3150, p3:3000 };
         const autoPot = reg.pot ? Number(reg.pot) :
           regStrength >= thresh.p1 ? 1 : regStrength >= thresh.p2 ? 2 : regStrength >= thresh.p3 ? 3 : 4;
         const playerRef = await db.collection('players').add({
@@ -5047,21 +5051,21 @@ app.post('/analyzeOpponent', async (req, res) => {
     // Assemble trend report block to inject into prompt
     const TREND_REPORT = `
 ════════════════════════════════════════════════════════════════
-TREND ANALYSIS ENGINE — \${oppPlayer.clubName} TRAJECTORY REPORT
-(\${oppMatches.length} matches analysed chronologically, oldest → newest)
+TREND ANALYSIS ENGINE — ${oppPlayer.clubName} TRAJECTORY REPORT
+(${oppMatches.length} matches analysed chronologically, oldest → newest)
 ════════════════════════════════════════════════════════════════
 
-FORM STREAK:       \${formStreak}
-RESULT SEQUENCE:   \${resultSeq.join(' → ')} (W=Win D=Draw L=Loss)
-SEASON RECORD:     \${oppTotalGF} scored / \${oppTotalGA} conceded / GD \${oppGD >= 0 ? '+' : ''}\${oppGD}
+FORM STREAK:       ${formStreak}
+RESULT SEQUENCE:   ${resultSeq.join(' → ')} (W=Win D=Draw L=Loss)
+SEASON RECORD:     ${oppTotalGF} scored / ${oppTotalGA} conceded / GD ${oppGD >= 0 ? '+' : ''}${oppGD}
 
 STATISTICAL TRAJECTORY (Early matches → Recent matches):
-  \${_trendDir('Goals scored/match',    earlyGF,      recentGF,      'GOALS SCORED/MATCH',   true)}
-  \${_trendDir('Goals conceded/match',  earlyGA,      recentGA,      'GOALS CONCEDED/MATCH',  false)}
-  \${_trendDir('Pass accuracy',         earlyPassAcc, recentPassAcc, 'PASS ACCURACY %',       true)}
-  \${_trendDir('Shot quality',          earlyShotQ,   recentShotQ,   'SHOT QUALITY RATIO %',  true)}
-  \${_trendDir('Possession',            earlyPoss,    recentPoss,    'POSSESSION %',          true)}
-  \${_trendDir('Shots per match',       earlyShots,   recentShots,   'SHOTS/MATCH',           true)}
+  ${_trendDir('Goals scored/match',    earlyGF,      recentGF,      'GOALS SCORED/MATCH',   true)}
+  ${_trendDir('Goals conceded/match',  earlyGA,      recentGA,      'GOALS CONCEDED/MATCH',  false)}
+  ${_trendDir('Pass accuracy',         earlyPassAcc, recentPassAcc, 'PASS ACCURACY %',       true)}
+  ${_trendDir('Shot quality',          earlyShotQ,   recentShotQ,   'SHOT QUALITY RATIO %',  true)}
+  ${_trendDir('Possession',            earlyPoss,    recentPoss,    'POSSESSION %',          true)}
+  ${_trendDir('Shots per match',       earlyShots,   recentShots,   'SHOTS/MATCH',           true)}
   ${_trendDir('Interceptions/match',   earlyInter,   recentInter,   'INTERCEPTIONS/MATCH',   true)}
   ${_trendDir('Tackles/match',         earlyTackles, recentTackles, 'TACKLES/MATCH',         true)}
   ${_trendDir('Saves/match',           earlySaves,   recentSaves,   'SAVES/MATCH',           false)}
@@ -5497,119 +5501,349 @@ app.get('/getMatchProbabilities', async (req, res) => {
       fixturesSnap = fSnap.docs;
     }
 
-    // ── Helper: calculate win probability for a pair ──────────────────────
-    function _calcProbability(pidA, pidB) {
-      const matchesA = playerMatchMap[pidA] || [];
-      const matchesB = playerMatchMap[pidB] || [];
+    // ══════════════════════════════════════════════════════════════════════
+    // PROBABILITY ENGINE v2 — Quality-Adjusted, Margin-Weighted, Decay-Form
+    // ══════════════════════════════════════════════════════════════════════
 
-      // Need 4+ matches each
-      if (matchesA.length < 4 || matchesB.length < 4) {
-        return { sufficient: false, reason: matchesA.length < 4 ? `${playerMap[pidA]?.clubName || pidA} needs ${4 - matchesA.length} more match(es)` : `${playerMap[pidB]?.clubName || pidB} needs ${4 - matchesB.length} more match(es)` };
+    // Helper: eFootball squad strength → tier score (0-100)
+    // Based on real 2026 eFootball strength tiers:
+    //   3320+ = Whale ceiling (top players, full 106-108 rated squads)
+    //   3250+ = Top 5-10% (Big Time / Epic Booster cards)
+    //   3150  = Standard competitive average
+    //   3000+ = Developing player
+    //   <3000 = New/themed/authentic squad
+    function _strengthScore(s) {
+      if (!s || s <= 0) return 50; // no data → neutral
+      if (s >= 3320) return 100;
+      if (s >= 3250) return 85 + ((s - 3250) / 70) * 15;
+      if (s >= 3150) return 60 + ((s - 3150) / 100) * 25;
+      if (s >= 3000) return 35 + ((s - 3000) / 150) * 25;
+      if (s >= 2800) return 15 + ((s - 2800) / 200) * 20;
+      return 10;
+    }
+
+    // Helper: opponent quality weight based on their rank/pot
+    // Win vs rank 1 player = 1.6x, win vs rank 20+ = 0.6x
+    function _opponentWeight(opponentId) {
+      const opp = playerMap[opponentId];
+      if (!opp) return 1.0;
+      const rank = opp.rank || 99;
+      const pot  = opp.pot  || 4;
+      // Combine rank and pot: P1 opponents top-weighted
+      if (pot === 1 || rank <= 3)  return 1.6;
+      if (pot === 2 || rank <= 7)  return 1.3;
+      if (pot === 3 || rank <= 14) return 1.0;
+      return 0.6; // P4 / bottom ranked
+    }
+
+    // Helper: score margin multiplier for a match result
+    function _marginMult(goalsFor, goalsAgainst, result) {
+      if (result === 'D') return 1.0;
+      const margin = Math.abs((goalsFor||0) - (goalsAgainst||0));
+      if (result === 'W') {
+        if (margin >= 3) return 1.35;
+        if (margin === 2) return 1.18;
+        return 1.0;
       }
+      // Loss
+      if (margin >= 3) return 0.65;
+      if (margin === 2) return 0.80;
+      return 0.92;
+    }
+
+    function _calcProbability(pidA, pidB) {
+      const matchesA = (playerMatchMap[pidA] || []).slice().sort((a,b) => {
+        const ta = a.verifiedAt ? (a.verifiedAt.toMillis ? a.verifiedAt.toMillis() : new Date(a.verifiedAt).getTime()) : 0;
+        const tb = b.verifiedAt ? (b.verifiedAt.toMillis ? b.verifiedAt.toMillis() : new Date(b.verifiedAt).getTime()) : 0;
+        return ta - tb;
+      });
+      const matchesB = (playerMatchMap[pidB] || []).slice().sort((a,b) => {
+        const ta = a.verifiedAt ? (a.verifiedAt.toMillis ? a.verifiedAt.toMillis() : new Date(a.verifiedAt).getTime()) : 0;
+        const tb = b.verifiedAt ? (b.verifiedAt.toMillis ? b.verifiedAt.toMillis() : new Date(b.verifiedAt).getTime()) : 0;
+        return ta - tb;
+      });
 
       const pA = playerMap[pidA] || {};
       const pB = playerMap[pidB] || {};
 
-      // ── COMPONENT 1: PR Rating gap (40%) ─────────────────────────────────
+      // ── COMPONENT 1: Squad Strength Prior ─────────────────────────────────
+      // Weight decays as match data accumulates (important early season, irrelevant by MD10)
+      // Arsenal 3200 vs Burnley 2850 should show significant prior advantage before kickoff
+      const sA = _strengthScore(pA.strength || 0);
+      const sB = _strengthScore(pB.strength || 0);
+      const sTotal = sA + sB;
+      const strengthProbA = sTotal > 0 ? sA / sTotal : 0.5;
+      const avgMatchCount = (matchesA.length + matchesB.length) / 2;
+      // Prior weight: 20% at 0 matches → 0% at 12+ matches (linear decay)
+      const strengthWeight = Math.max(0, 0.20 * (1 - Math.min(avgMatchCount, 12) / 12));
+
+      // If not enough data for statistical model, return strength-only estimate
+      if (matchesA.length < 4 || matchesB.length < 4) {
+        // Use strength as soft prior when available
+        const hasSomeData = matchesA.length > 0 || matchesB.length > 0;
+        if ((pA.strength || 0) > 0 && (pB.strength || 0) > 0) {
+          const softProb = strengthProbA;
+          const softWinA = Math.max(15, Math.min(80, Math.round(softProb * 85)));
+          const softDraw = 15;
+          const softWinB = 100 - softWinA - softDraw;
+          return {
+            sufficient: false,
+            softEstimate: true,
+            winProbA: softWinA, winProbB: Math.max(5, softWinB), drawProb: softDraw,
+            reason: matchesA.length < 4
+              ? `${pA.clubName || pidA} needs ${4 - matchesA.length} more match(es) for full analysis`
+              : `${pB.clubName || pidB} needs ${4 - matchesB.length} more match(es) for full analysis`,
+            strengthOnly: true,
+            strengthA: pA.strength, strengthB: pB.strength
+          };
+        }
+        return {
+          sufficient: false,
+          reason: matchesA.length < 4
+            ? `${pA.clubName || pidA} needs ${4 - matchesA.length} more match(es)`
+            : `${pB.clubName || pidB} needs ${4 - matchesB.length} more match(es)`
+        };
+      }
+
+      // ── COMPONENT 2: Opponent-Quality-Adjusted PR (30%) ──────────────────
+      // Each win/loss weighted by opponent quality so beating P1 players counts more
       const prA = pA.performanceRating != null ? pA.performanceRating : 50;
       const prB = pB.performanceRating != null ? pB.performanceRating : 50;
-      const prDiff = prA - prB; // positive = A stronger
-      // Convert PR diff to probability using logistic curve
-      // PR diff of 30 = ~80% win chance for stronger player
-      const prProbA = 1 / (1 + Math.pow(10, -prDiff / 30));
+      // Quality-adjust: re-score PR using opponent-weighted results
+      const _qualAdjPR = (matches) => {
+        if (!matches.length) return 50;
+        let weightedScore = 0, totalWeight = 0;
+        matches.forEach(m => {
+          const oppW = _opponentWeight(m.opponentId);
+          const baseScore = m.result === 'W' ? 1 : m.result === 'D' ? 0.4 : 0;
+          const marginM = _marginMult(m.goalsFor, m.goalsAgainst, m.result);
+          weightedScore += baseScore * oppW * marginM;
+          totalWeight   += oppW;
+        });
+        // Normalise to 0-100 PR scale
+        return totalWeight > 0 ? Math.round((weightedScore / totalWeight) * 100) : 50;
+      };
+      const qaprA = _qualAdjPR(matchesA);
+      const qaprB = _qualAdjPR(matchesB);
+      const qaprDiff = qaprA - qaprB;
+      const qaprProbA = 1 / (1 + Math.pow(10, -qaprDiff / 25)); // logistic: diff 25 = ~85% win
 
-      // ── COMPONENT 2: Recent form — last 3 matches (25%) ──────────────────
-      const recentA = matchesA.slice(-3);
-      const recentB = matchesB.slice(-3);
-      const formScoreA = recentA.reduce((acc, m) => acc + (m.result === 'W' ? 1 : m.result === 'D' ? 0.4 : 0), 0) / recentA.length;
-      const formScoreB = recentB.reduce((acc, m) => acc + (m.result === 'W' ? 1 : m.result === 'D' ? 0.4 : 0), 0) / recentB.length;
+      // ── COMPONENT 3: Exponential Form Decay — last 5 matches (20%) ───────
+      // Recent matches weighted heavily, margin of victory included
+      // Decay: most recent = 2.0x, -2 = 1.5x, -3 = 1.0x, -4 = 0.75x, -5 = 0.5x
+      const _decayFormScore = (matches) => {
+        const recent = matches.slice(-5);
+        const decayWeights = [0.5, 0.75, 1.0, 1.5, 2.0]; // oldest → newest
+        const offset = 5 - recent.length;
+        let score = 0, totalW = 0;
+        recent.forEach((m, i) => {
+          const dw = decayWeights[offset + i];
+          const oppW = _opponentWeight(m.opponentId);
+          const marginM = _marginMult(m.goalsFor, m.goalsAgainst, m.result);
+          const baseScore = m.result === 'W' ? 1 : m.result === 'D' ? 0.4 : 0;
+          score  += baseScore * dw * marginM * oppW;
+          totalW += dw * oppW;
+        });
+        return totalW > 0 ? score / totalW : 0.5;
+      };
+      const formScoreA = _decayFormScore(matchesA);
+      const formScoreB = _decayFormScore(matchesB);
       const formTotal  = formScoreA + formScoreB;
       const formProbA  = formTotal > 0 ? formScoreA / formTotal : 0.5;
 
-      // ── COMPONENT 3: Head-to-head record (20%) ───────────────────────────
-      // Check all matchStats where playerId=A and opponentId=B or vice versa
+      // ── COMPONENT 4: H2H with margin weighting (15%) ─────────────────────
       const h2hMatchesA = matchesA.filter(m => m.opponentId === pidB);
       const h2hMatchesB = matchesB.filter(m => m.opponentId === pidA);
-      let h2hProbA = 0.5; // default: no H2H data
-      if (h2hMatchesA.length > 0 || h2hMatchesB.length > 0) {
-        const h2hWinsA = h2hMatchesA.filter(m => m.result === 'W').length;
-        const h2hWinsB = h2hMatchesB.filter(m => m.result === 'W').length;
-        const h2hTotal = h2hWinsA + h2hWinsB;
-        if (h2hTotal > 0) h2hProbA = h2hWinsA / h2hTotal;
+      let h2hProbA = 0.5;
+      const hasH2H = h2hMatchesA.length > 0 || h2hMatchesB.length > 0;
+      if (hasH2H) {
+        // Weight by margin: 3-0 win scores 1.35x vs 1-0 win
+        let h2hScoreA = 0, h2hScoreB = 0, h2hTotalW = 0;
+        [...h2hMatchesA, ...h2hMatchesB].forEach(m => {
+          const isA = h2hMatchesA.includes(m);
+          const marginM = _marginMult(m.goalsFor, m.goalsAgainst, m.result);
+          const baseScore = m.result === 'W' ? 1 : m.result === 'D' ? 0.4 : 0;
+          const weighted = baseScore * marginM;
+          if (isA) h2hScoreA += weighted; else h2hScoreB += weighted;
+          h2hTotalW += marginM;
+        });
+        if (h2hTotalW > 0) {
+          h2hProbA = h2hScoreA / (h2hScoreA + h2hScoreB + 0.001);
+        }
       }
-      const h2hWeight = (h2hMatchesA.length + h2hMatchesB.length) > 0 ? 0.20 : 0; // skip if no H2H
-      const prWeightAdj  = h2hWeight === 0 ? 0.50 : 0.40; // redistribute H2H weight to PR if no H2H
-      const formWeightAdj = h2hWeight === 0 ? 0.30 : 0.25;
+      const h2hWeight     = hasH2H ? 0.15 : 0;
 
-      // ── COMPONENT 4: Shot efficiency delta (10%) ─────────────────────────
-      const _shotAcc = matches => {
-        const vals = matches.map(m => m.stats && m.stats.shots > 0 && m.stats.shotsOnTarget != null
-          ? m.stats.shotsOnTarget / m.stats.shots : null).filter(v => v !== null);
-        return vals.length ? vals.reduce((a,b) => a+b,0) / vals.length : 0.5;
+      // ── COMPONENT 5: Possession + Shot quality control score (10%) ───────
+      // High possession + clinical shooting = controlled dominance
+      const _controlScore = (matches) => {
+        const posVals  = matches.map(m => m.stats?.possession != null ? m.stats.possession / 100 : null).filter(v => v !== null);
+        const shotVals = matches.map(m => m.stats?.shots > 0 && m.stats?.shotsOnTarget != null ? m.stats.shotsOnTarget / m.stats.shots : null).filter(v => v !== null);
+        const avgPos  = posVals.length  ? posVals.reduce((a,b)  => a+b,0) / posVals.length  : 0.5;
+        const avgShot = shotVals.length ? shotVals.reduce((a,b) => a+b,0) / shotVals.length : 0.4;
+        // Combined: 60% possession, 40% shot quality
+        return avgPos * 0.6 + avgShot * 0.4;
       };
-      const shotAccA = _shotAcc(matchesA);
-      const shotAccB = _shotAcc(matchesB);
-      const shotTotal = shotAccA + shotAccB;
-      const shotProbA = shotTotal > 0 ? shotAccA / shotTotal : 0.5;
+      const ctrlA = _controlScore(matchesA);
+      const ctrlB = _controlScore(matchesB);
+      const ctrlTotal = ctrlA + ctrlB;
+      const ctrlProbA = ctrlTotal > 0 ? ctrlA / ctrlTotal : 0.5;
 
-      // ── COMPONENT 5: Defensive record delta (5%) ─────────────────────────
-      const _gaPerMatch = matches => {
-        const vals = matches.map(m => m.goalsAgainst != null ? m.goalsAgainst : null).filter(v => v !== null);
-        return vals.length ? vals.reduce((a,b) => a+b,0) / vals.length : 1.5;
+      // ── COMPONENT 6: Defensive solidity (5%) ─────────────────────────────
+      // Goals conceded + defensive activity (tackles + interceptions)
+      const _defScore = (matches) => {
+        const gaVals = matches.map(m => m.goalsAgainst != null ? m.goalsAgainst : null).filter(v => v !== null);
+        const actVals = matches.map(m => {
+          const t = m.stats?.tackles ?? null;
+          const i = m.stats?.interceptions ?? null;
+          if (t === null && i === null) return null;
+          return Math.min(1.0, ((t||0) + (i||0)) / 12); // normalise: 12 combined = max
+        }).filter(v => v !== null);
+        const avgGA  = gaVals.length  ? gaVals.reduce((a,b)  => a+b,0) / gaVals.length  : 1.5;
+        const avgAct = actVals.length ? actVals.reduce((a,b) => a+b,0) / actVals.length : 0.4;
+        // Lower GA = better. Higher activity = better.
+        const gaScore  = Math.max(0, Math.min(1, 1 - avgGA / 4));
+        return gaScore * 0.65 + avgAct * 0.35;
       };
-      const gaA = _gaPerMatch(matchesA); // lower = better
-      const gaB = _gaPerMatch(matchesB);
-      // Invert: lower conceded = higher probability
-      const defProbA = gaA < gaB ? 0.65 : gaA > gaB ? 0.35 : 0.5;
+      const defScoreA = _defScore(matchesA);
+      const defScoreB = _defScore(matchesB);
+      const defTotal  = defScoreA + defScoreB;
+      const defProbA  = defTotal > 0 ? defScoreA / defTotal : 0.5;
 
-      // ── Weighted combination ──────────────────────────────────────────────
+      // ── Dynamic weight allocation ─────────────────────────────────────────
+      // Weights sum to 1.0. H2H weight redistributed to QAPR+Form if no H2H.
+      const baseWeights = {
+        strength: strengthWeight,        // 0-20% (decays with match count)
+        qapr:     0.30,
+        form:     0.20,
+        h2h:      h2hWeight,            // 0 or 0.15
+        ctrl:     0.10,
+        def:      0.05
+      };
+      // Remaining after strength + h2h deductions
+      const fixedSum = baseWeights.strength + baseWeights.h2h + baseWeights.ctrl + baseWeights.def;
+      const qaprFormBudget = 1.0 - fixedSum;
+      // Split remaining 60/40 between qapr and form
+      const wQAPR = qaprFormBudget * 0.60;
+      const wForm = qaprFormBudget * 0.40;
+
       const rawProbA = (
-        prProbA   * prWeightAdj   +
-        formProbA * formWeightAdj +
-        h2hProbA  * h2hWeight     +
-        shotProbA * 0.10          +
-        defProbA  * 0.05
+        strengthProbA * baseWeights.strength +
+        qaprProbA     * wQAPR                +
+        formProbA     * wForm                +
+        h2hProbA      * baseWeights.h2h      +
+        ctrlProbA     * baseWeights.ctrl     +
+        defProbA      * baseWeights.def
       );
 
-      // ── Draw probability — higher when teams are closely matched ──────────
-      const closeness = 1 - Math.abs(rawProbA - 0.5) * 2; // 1 = 50/50, 0 = complete mismatch
-      const drawProb  = Math.round(closeness * 22); // max ~22% draw probability (eFootball is low scoring)
+      // ── Draw probability ───────────────────────────────────────────────────
+      const closeness  = 1 - Math.abs(rawProbA - 0.5) * 2;
+      const drawProb   = Math.round(closeness * 20); // max 20% (eFootball tends decisive)
       const winProbARaw = Math.round(rawProbA * (100 - drawProb));
       const winProbBRaw = 100 - drawProb - winProbARaw;
-
-      // Clamp to sensible range (minimum 5% for any outcome)
-      const winProbA = Math.max(5, Math.min(90, winProbARaw));
-      const winProbB = Math.max(5, Math.min(90, winProbBRaw));
+      const winProbA   = Math.max(5, Math.min(88, winProbARaw));
+      const winProbB   = Math.max(5, Math.min(88, winProbBRaw));
       const drawProbFinal = 100 - winProbA - winProbB;
 
-      // Confidence: higher when more matches available and H2H exists
-      const avgMatches = (matchesA.length + matchesB.length) / 2;
-      const confidence = Math.min(100, Math.round(
-        (Math.min(avgMatches, 10) / 10) * 70 +
-        (h2hMatchesA.length > 0 ? 20 : 0) +
-        10
+      // ── Confidence score ───────────────────────────────────────────────────
+      const avgMatches2 = (matchesA.length + matchesB.length) / 2;
+      const confidence  = Math.min(100, Math.round(
+        (Math.min(avgMatches2, 12) / 12) * 60 +  // up to 60% from match volume
+        (hasH2H ? 20 : 0)                       +  // 20% from H2H data
+        ((pA.strength && pB.strength) ? 10 : 0)  + // 10% if strength data exists
+        10                                          // base 10%
       ));
 
-      // Narrative label
+      // ── Narrative ─────────────────────────────────────────────────────────
       let narrative = '';
-      if (winProbA >= 70)      narrative = `${pA.clubName || pidA} are strong favourites`;
-      else if (winProbA >= 58) narrative = `${pA.clubName || pidA} have the edge`;
+      if (winProbA >= 72)      narrative = `${pA.clubName || 'Team A'} are strong favourites`;
+      else if (winProbA >= 60) narrative = `${pA.clubName || 'Team A'} have the edge`;
       else if (winProbA >= 48) narrative = 'Evenly matched — could go either way';
-      else if (winProbB >= 58) narrative = `${pB.clubName || pidB} have the edge`;
-      else                     narrative = `${pB.clubName || pidB} are strong favourites`;
+      else if (winProbB >= 60) narrative = `${pB.clubName || 'Team B'} have the edge`;
+      else                     narrative = `${pB.clubName || 'Team B'} are strong favourites`;
+
+      // ── Recent form strings (for display) ────────────────────────────────
+      const recentA = matchesA.slice(-5);
+      const recentB = matchesB.slice(-5);
 
       return {
-        sufficient: true,
+        sufficient:    true,
         winProbA, winProbB, drawProb: drawProbFinal,
         confidence,
         narrative,
-        prA, prB,
+        prA: qaprA, prB: qaprB,          // now quality-adjusted
+        strengthA: pA.strength || 0,
+        strengthB: pB.strength || 0,
         tierA: pA.playerTier || null,
         tierB: pB.playerTier || null,
         formA: recentA.map(m => m.result).join(''),
         formB: recentB.map(m => m.result).join(''),
-        h2hRecord: h2hMatchesA.length > 0 ? `${h2hMatchesA.filter(m=>m.result==='W').length}W-${h2hMatchesA.filter(m=>m.result==='D').length}D-${h2hMatchesA.filter(m=>m.result==='L').length}L` : 'No H2H'
+        h2hRecord: hasH2H
+          ? `${h2hMatchesA.filter(m=>m.result==='W').length}W-${h2hMatchesA.filter(m=>m.result==='D').length}D-${h2hMatchesA.filter(m=>m.result==='L').length}L`
+          : 'No H2H',
+        // Expose component breakdown for transparency
+        components: {
+          strengthPrior: Math.round(strengthProbA * 100),
+          qualAdjPR:     Math.round(qaprProbA * 100),
+          decayForm:     Math.round(formProbA * 100),
+          h2h:           Math.round(h2hProbA * 100),
+          control:       Math.round(ctrlProbA * 100),
+          defense:       Math.round(defProbA * 100)
+        }
       };
+    }
+
+    // ── Helper: AI tactical insight for a matchup ────────────────────────
+    // Reads playstyle fingerprints and returns contextual analysis
+    async function _aiTacticalInsight(pidA, pidB, prob) {
+      if (!prob.sufficient) return null;
+      try {
+        const [fpASnap, fpBSnap] = await Promise.all([
+          db.collection('playerProfile').doc(pidA).get(),
+          db.collection('playerProfile').doc(pidB).get()
+        ]);
+        const fpA = fpASnap.exists ? fpASnap.data() : null;
+        const fpB = fpBSnap.exists ? fpBSnap.data() : null;
+        const pA  = playerMap[pidA] || {};
+        const pB  = playerMap[pidB] || {};
+
+        // Only call AI if at least one fingerprint exists
+        if (!fpA && !fpB) return null;
+
+        const prompt = `You are a tactical analyst for Campus eSports Elite, a university eFootball tournament. Analyse this upcoming fixture and provide a concise tactical breakdown.
+
+FIXTURE:
+${pA.clubName || 'Team A'} (Strength: ${pA.strength || 'unknown'}, Pot: P${pA.pot || '?'}) vs ${pB.clubName || 'Team B'} (Strength: ${pB.strength || 'unknown'}, Pot: P${pB.pot || '?'})
+
+STATISTICAL PROBABILITY:
+${pA.clubName || 'Team A'}: ${prob.winProbA}% | Draw: ${prob.drawProb}% | ${pB.clubName || 'Team B'}: ${prob.winProbB}%
+Confidence: ${prob.confidence}%
+
+${fpA ? `${pA.clubName || 'Team A'} PLAYSTYLE:
+${fpA.fingerprintText || 'No fingerprint data'}` : `${pA.clubName || 'Team A'}: No behavioural data yet`}
+
+${fpB ? `${pB.clubName || 'Team B'} PLAYSTYLE:
+${fpB.fingerprintText || 'No fingerprint data'}` : `${pB.clubName || 'Team B'}: No behavioural data yet`}
+
+Respond ONLY in JSON, no markdown, no preamble:
+{
+  "keyBattleground": "<one sentence: the specific tactical contest that will decide this match>",
+  "upsetPath": "<one sentence: exactly how the underdog can win>",
+  "tacticalEdge": "<one sentence: what the favourite must do to guarantee the win>",
+  "watchFor": "<one word or short phrase: the key stat or moment to watch>"
+}`;
+
+        const gaRes = await _geminiPost({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: 300, temperature: 0.3 }
+        });
+        if (!gaRes.ok) return null;
+        const raw = (gaRes.data?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+        const clean = raw.replace(/```json|```/g, '').trim();
+        return JSON.parse(clean);
+      } catch(e) {
+        console.warn('[CEE] AI tactical insight failed (non-blocking):', e.message);
+        return null;
+      }
     }
 
     // ── Calculate for all fixtures ────────────────────────────────────────
@@ -5622,6 +5856,13 @@ app.get('/getMatchProbabilities', async (req, res) => {
       if (!pidA || !pidB) continue;
 
       const prob = _calcProbability(pidA, pidB);
+
+      // AI tactical insight — only for fixtures with sufficient data, non-blocking
+      let tacticalInsight = null;
+      if (prob.sufficient) {
+        tacticalInsight = await _aiTacticalInsight(pidA, pidB, prob).catch(() => null);
+      }
+
       results.push({
         fixtureId: fid,
         playerAId: pidA,
@@ -5630,7 +5871,8 @@ app.get('/getMatchProbabilities', async (req, res) => {
         playerBName: playerMap[pidB]?.clubName || pidB,
         matchDay: f.matchday || null,
         status: f.status || null,
-        ...prob
+        ...prob,
+        tacticalInsight
       });
     }
 
@@ -5905,7 +6147,7 @@ app.get('/getAutomationConfig', async (req, res) => {
       autoPotAssign:         d.autoPotAssign         !== false,
       autoOpenWindows:       d.autoOpenWindows       !== false,
       autoSeasonNotify:      d.autoSeasonNotify      !== false,
-      potThresholds:         d.potThresholds         || { p1:3100, p2:2900, p3:2700 }
+      potThresholds:         d.potThresholds         || { p1:3250, p2:3150, p3:3000 }
     });
   } catch(e) { return res.status(500).json({ success:false, message:e.message }); }
 });
