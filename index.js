@@ -431,28 +431,6 @@ function _pickBrevoAccount() {
   return null; // all accounts exhausted for today
 }
 
-// ── HTML email template (CEE branding) ───────────────────────────────────
-function emailHtml(subject, bodyHtml) {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8">
-<style>
-  body{background:#111119;font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:0}
-  .w{max-width:600px;margin:0 auto;background:#1E1E2C;border:1px solid rgba(240,165,0,.18)}
-  .h{background:linear-gradient(135deg,#C8860A,#F0A500);padding:24px 32px}
-  .ht{color:#000;font-size:18px;font-weight:700;letter-spacing:.05em;margin:0}
-  .hs{color:rgba(0,0,0,.65);font-size:11px;letter-spacing:.14em;text-transform:uppercase;margin-top:4px}
-  .b{padding:32px}.b p{color:#BBBBC8;font-size:14px;line-height:1.8;margin:0 0 14px}
-  .b strong{color:#EEEEF8}
-  .hl{background:rgba(240,165,0,.08);border-left:3px solid #F0A500;padding:12px 16px;margin:16px 0;color:#F0A500;font-size:13px}
-  .f{border-top:1px solid rgba(240,165,0,.1);padding:20px 32px;text-align:center}
-  .f p{color:rgba(136,136,160,.5);font-size:11px;margin:0}
-</style></head><body>
-<div class="w">
-<div class="h"><div class="ht">⚡ CEE — Campus eSports Elite</div><div class="hs">${subject}</div></div>
-<div class="b">${bodyHtml}</div>
-<div class="f"><p>Campus eSports Elite · Nigeria Campus League · Automated notification</p></div>
-</div></body></html>`;
-}
-
 // ── Core Brevo send (single account, single email) ───────────────────────
 async function _sendViaBrevo(acct, to, subject, htmlBody) {
   try {
@@ -698,17 +676,22 @@ async function _notifyPlayer(pid, fixtureId, eventType, subject, htmlBody, tgTex
     results.whatsapp = 'queued';
   }
 
-  // Log the attempt
-  const channel = [
+  // Log the attempt — use actual delivery result, not assumed 'sent'
+  const channelList = [
     results.telegram && 'telegram',
     results.email    && 'email',
     results.push     && 'push',
     results.whatsapp && 'whatsapp'
   ].filter(Boolean).join('+') || 'none';
+  const actualStatus = (
+    results.telegram === 'sent' || results.email === 'sent' ||
+    results.push === 'sent' || results.whatsapp === 'queued'
+  ) ? 'sent' : 'failed';
 
-  await logNotif(fixtureId, pid, channel, eventType, 'sent', null, {
-    messageText: tgText, emailSubject: subject, emailHtmlBody: htmlBody,
-    telegramChatId: p.telegramChatId || null, email: p.email || null
+  await logNotif(fixtureId, pid, channelList, eventType, actualStatus, null, {
+    messageText: tgText, emailSubject: subject,
+    telegramChatId: p.telegramChatId || null, email: p.email || null,
+    deliveryResults: results
   }).catch(() => {});
 
   return results;
@@ -1129,21 +1112,50 @@ async function _recalculatePlayerTiers(seasonId, sortedStandings) {
   // Calculate PR for each player with 4+ matches
   const prScores = []; // { playerId, pr, matchCount }
 
+  // Build player doc map for linkedPreviousPlayerIds lookup
+  const playerDocMap = {};
+  try {
+    const plDocs = await db.collection('players').where('seasonId','==',seasonId).get();
+    plDocs.forEach(d => { playerDocMap[d.id] = d.data(); });
+  } catch(e) { /* non-fatal */ }
+
   for (const standing of sortedStandings) {
     const pid = standing.id;
-    const matches = playerMatchMap[pid] || [];
-    if (matches.length < 4) continue; // Not enough data
+    let matches = playerMatchMap[pid] || [];
+
+    // Cross-season supplement: if sparse this season, add previous season matches at 60% weight
+    if (matches.length < 6) {
+      try {
+        const pDoc = playerDocMap[pid] || {};
+        const linkedIds = pDoc.linkedPreviousPlayerIds || [];
+        if (linkedIds.length > 0) {
+          const prevSnap = await db.collection('matchStats')
+            .where('playerId', 'in', linkedIds.slice(0,10))
+            .orderBy('verifiedAt', 'desc')
+            .limit(10)
+            .get();
+          prevSnap.forEach(d => {
+            matches = [...matches, { ...d.data(), _prevSeasonWeight: 0.6 }];
+          });
+        }
+      } catch(e) { /* non-fatal */ }
+    }
+
+    if (matches.length < 4) continue; // Not enough data even after cross-season pull
 
     const n = matches.length;
-    const wins   = matches.filter(m => m.result === 'W').length;
-    const losses = matches.filter(m => m.result === 'L').length;
+    // Weight-aware counts: previous season matches count at 60%
+    const weightedN    = matches.reduce((acc, m) => acc + (m._prevSeasonWeight || 1.0), 0);
+    const wins         = matches.filter(m => m.result === 'W').length;
+    const losses       = matches.filter(m => m.result === 'L').length;
+    const weightedWins = matches.reduce((acc, m) => acc + (m.result === 'W' ? (m._prevSeasonWeight || 1.0) : 0), 0);
 
-    // Win rate (0–100)
-    const winRate = (wins / n) * 100;
+    // Win rate (0–100) — weight-adjusted
+    const winRate = (weightedWins / weightedN) * 100;
 
-    // GD per match — normalise to 0–100 (cap at +5 GD/m = 100, -5 GD/m = 0)
-    const totalGD = matches.reduce((acc, m) => acc + ((m.goalsFor || 0) - (m.goalsAgainst || 0)), 0);
-    const gdPerMatch = totalGD / n;
+    // GD per match — weight-adjusted (prev season matches at 60%)
+    const totalGD = matches.reduce((acc, m) => acc + ((m.goalsFor || 0) - (m.goalsAgainst || 0)) * (m._prevSeasonWeight || 1.0), 0);
+    const gdPerMatch = totalGD / weightedN;
     const gdScore = Math.max(0, Math.min(100, (gdPerMatch + 5) * 10)); // -5→0, 0→50, +5→100
 
     // Shot accuracy (shotsOnTarget / shots * 100), avg across matches with data
@@ -1160,12 +1172,12 @@ async function _recalculatePlayerTiers(seasonId, sortedStandings) {
       .filter(v => v !== null);
     const passAcc = passAccVals.length ? passAccVals.reduce((a,b) => a+b, 0) / passAccVals.length : 65;
 
-    // Goals scored per match (cap at 5 = 100)
-    const goalsPerMatch = matches.reduce((acc, m) => acc + (m.goalsFor || 0), 0) / n;
+    // Goals scored per match — weight-adjusted (cap at 5 = 100)
+    const goalsPerMatch = matches.reduce((acc, m) => acc + (m.goalsFor || 0) * (m._prevSeasonWeight || 1.0), 0) / weightedN;
     const goalsScore = Math.min(100, (goalsPerMatch / 5) * 100);
 
-    // Defensive record -- invert goals conceded per match (0 conceded = 100, 5+ = 0)
-    const concededPerMatch = matches.reduce((acc, m) => acc + (m.goalsAgainst || 0), 0) / n;
+    // Defensive record -- weight-adjusted (0 conceded = 100, 5+ = 0)
+    const concededPerMatch = matches.reduce((acc, m) => acc + (m.goalsAgainst || 0) * (m._prevSeasonWeight || 1.0), 0) / weightedN;
     const defScore = Math.max(0, Math.min(100, (1 - concededPerMatch / 5) * 100));
 
     // Defensive activity -- tackles + interceptions combined, normalised to 0-100
@@ -1428,7 +1440,25 @@ app.post('/verifyPlayerPin', async (req, res) => {
       if(!byClub.empty){const d=byClub.docs[0];player={id:d.id,...d.data()};}}
     if (!player){const byIni=await db.collection('players').where('seasonId','==',seasonId).where('initials','==',tagUpper).limit(1).get();
       if(!byIni.empty){const d=byIni.docs[0];player={id:d.id,...d.data()};}}
-    if (!player) return res.json({ success:false, message:'Player not found. Check your gaming tag.' });
+    if (!player) {
+      // Check if this tag exists in a previous season — helpful hint for returning players
+      try {
+        const prevSnap = await db.collection('players')
+          .where('gameName', '==', tagUpper)
+          .limit(1).get();
+        const prevByClub = prevSnap.empty
+          ? await db.collection('players').where('clubName', '==', tagUpper).limit(1).get()
+          : null;
+        const foundPrev = !prevSnap.empty || (prevByClub && !prevByClub.empty);
+        if (foundPrev) {
+          return res.json({
+            success: false,
+            message: 'Tag found in a previous season but not this one. If you played before, re-register for this season and your history will carry over automatically.'
+          });
+        }
+      } catch(e) { /* non-fatal */ }
+      return res.json({ success:false, message:'Player not found. Check your gaming tag.' });
+    }
 
     // Check if player is blocked (integrity/admin block)
     if (player.hubBlocked) {
@@ -2307,14 +2337,13 @@ async function _buildPlaystyleFingerprint(playerId, seasonId) {
       .where('seasonId', '==', seasonId)
       .get();
 
-    if (snap.empty) return;
-
     const matches = [];
     snap.forEach(d => matches.push(d.data()));
 
     // ── Also pull from identity-linked previous player IDs ───────────────────
     // This makes the fingerprint truly all-time, not just current season.
-    // A player's confirmed patterns from previous seasons are included.
+    // A returning player with 0 current-season matches still gets a fingerprint
+    // from their previous season history — vital for Season 2 early matchdays.
     try {
       const pdSnap = await db.collection('players').doc(playerId).get();
       if (pdSnap.exists) {
@@ -2328,6 +2357,9 @@ async function _buildPlaystyleFingerprint(playerId, seasonId) {
         }
       }
     } catch(e) { /* non-fatal — fingerprint still works from current season only */ }
+
+    // Nothing to fingerprint even after cross-season pull — bail
+    if (!matches.length) return;
 
     const n = matches.length;
 
@@ -2448,7 +2480,7 @@ Tackles: ${myStats.tackles??'N/A'} | Interceptions: ${myStats.interceptions??'N/
 Crosses: ${myStats.crosses??'N/A'} | Corners: ${myStats.cornerKicks??'N/A'} | Fouls: ${myStats.fouls??'N/A'} | Offsides: ${myStats.offsides??'N/A'}
 ${matchContext ? `Formation: ${matchContext.formation||'unknown'} | Attack direction: ${matchContext.attackDirection||'unknown'}${matchContext.scoredFirst?' | Scored first':''}${matchContext.setpieceGoal?' | Set piece goal':''}${matchContext.momentumShift?' | Felt momentum shift':''}` : 'Post-match questionnaire: not completed this match'}`;
 
-    // ── Fetch previous match for progressive tips ──────────────────────────
+    // ── Fetch previous match for progressive tips (cross-season aware) ────
     let lastMatchBlock = '';
     let hasLastMatch   = false;
     let prevMatchDay   = '?';
@@ -2459,8 +2491,25 @@ ${matchContext ? `Formation: ${matchContext.formation||'unknown'} | Attack direc
         .orderBy('verifiedAt', 'desc')
         .limit(2)
         .get();
+      // Cross-season fallback: if first match of the season, pull last match from prev season
+      let prevDoc = null;
       if (prevSnap.size >= 2) {
-        const prev  = prevSnap.docs[1].data();
+        prevDoc = prevSnap.docs[1].data();
+      } else {
+        // Try previous season via linkedPreviousPlayerIds
+        const pdFull = pdSnap.exists ? pdSnap.data() : {};
+        const linkedIds = pdFull.linkedPreviousPlayerIds || [];
+        if (linkedIds.length > 0) {
+          const xSnap = await db.collection('matchStats')
+            .where('playerId', 'in', linkedIds.slice(0,10))
+            .orderBy('verifiedAt', 'desc')
+            .limit(1)
+            .get();
+          if (!xSnap.empty) prevDoc = { ...xSnap.docs[0].data(), _prevSeason: true };
+        }
+      }
+      if (prevDoc) {
+        const prev  = prevDoc;
         const ps    = prev.stats || {};
         const pAcc  = ps.passes && ps.passes > 0 && ps.successfulPasses != null ? Math.round((ps.successfulPasses/ps.passes)*100)+'%' : 'N/A';
         const pSQ   = ps.shots  && ps.shots  > 0 && ps.shotsOnTarget    != null ? Math.round((ps.shotsOnTarget/ps.shots)*100)+'%'    : 'N/A';
@@ -2473,12 +2522,14 @@ Possession: ${ps.possession!=null?ps.possession+'%':'N/A'} | Shots: ${ps.shots??
 Passes: ${ps.passes??'N/A'} (${ps.successfulPasses??'?'} successful) | Pass accuracy: ${pAcc}
 Tackles: ${ps.tackles??'N/A'} | Interceptions: ${ps.interceptions??'N/A'} | Saves: ${ps.saves??'N/A'}
 ${prev.context ? `Formation: ${prev.context.formation||'unknown'} | Attack: ${prev.context.attackDirection||'unknown'}` : ''}`;
+        prevMatchDay = prev.matchDay || (prev._prevSeason ? '[prev season]' : '?');
         hasLastMatch = true;
       }
     } catch(e2) { console.error('[CEE] quickAnalysis prev fetch:', e2.message); }
 
     // ── Build prompt ──────────────────────────────────────────────────────────
-    const prompt = hasLastMatch ? `You are a personal eFootball coach reviewing a player's stats across recent matches. Here are their stats from their last match and their current match. Compare them directly. Tell the player: 1) What improved, 2) What got worse, 3) One specific thing to work on before their next match. Reference actual numbers. Be encouraging but honest. Maximum 12 lines.
+    const isCrossSeasonCompare = hasLastMatch && lastMatchBlock.includes('[prev season]');
+    const prompt = hasLastMatch ? `You are a personal eFootball coach reviewing a player's stats across recent matches. Here are their stats from their last match and their current match. Compare them directly. Tell the player: 1) What improved, 2) What got worse, 3) One specific thing to work on before their next match. Reference actual numbers. Be encouraging but honest. Maximum 12 lines.${isCrossSeasonCompare ? ' Note: the previous match shown is from a previous season — acknowledge this briefly and focus on what has carried over.' : ''}
 
 PLAYER: ${playerName}
 
@@ -2837,21 +2888,56 @@ app.post('/sendNotification', async (req, res) => {
     }
 
     // For Firestore player IDs, use _notifyPlayer so all channels fire
+    const deliveryReport = [];
     for (const pid of recipients) {
       const doEmail    = !channel || channel === 'email'    || channel === 'both';
       const doTelegram = !channel || channel === 'telegram' || channel === 'both';
       const snap = await db.collection('players').doc(pid).get();
-      if (!snap.exists) continue;
+      if (!snap.exists) {
+        console.warn(`[CEE] sendNotification: player ${pid} not found in Firestore`);
+        deliveryReport.push({ pid, error: 'Player not found in Firestore' });
+        continue;
+      }
       const p = snap.data();
-      if (doTelegram && p.telegramChatId) await sendTelegram(p.telegramChatId, message).catch(()=>{});
-      if (doEmail    && p.email)          await sendEmail(p.email, subj, html).catch(()=>{});
-      // Always queue WhatsApp relay for admin-sent notifications
+      const report = { pid, name: p.clubName || p.gameName || pid, telegram: null, email: null };
+
+      // Telegram
+      if (doTelegram) {
+        if (!p.telegramChatId) {
+          report.telegram = 'skipped — not linked (player must message the bot with /start)';
+        } else {
+          const tgR = await sendTelegram(p.telegramChatId, message);
+          report.telegram = (tgR && tgR.ok) ? 'sent' : ('failed — ' + (tgR && tgR.description || 'unknown error'));
+          if (!tgR || !tgR.ok) console.warn(`[CEE] Telegram failed for ${pid}:`, tgR);
+        }
+      }
+
+      // Email
+      if (doEmail) {
+        if (!p.email) {
+          report.email = 'skipped — no email on player record';
+        } else {
+          const emR = await sendEmail(p.email, subj, html);
+          report.email = emR.success ? 'sent' : ('failed — ' + (emR.error || 'unknown error'));
+          if (!emR.success) console.warn(`[CEE] Email failed for ${pid}:`, emR.error);
+        }
+      }
+
+      // WhatsApp relay
       if (p.whatsappNumber) await _queueWhatsAppRelay(null, pid, p, message).catch(()=>{});
-      await logNotif(null, pid, channel||'both', eventType||'MANUAL', 'sent', null,
-        { messageText: message, emailSubject: subj }).catch(()=>{});
+
+      const actualStatus = (report.telegram === 'sent' || report.email === 'sent') ? 'sent' : 'failed';
+      await logNotif(null, pid, channel||'both', eventType||'MANUAL', actualStatus, null,
+        { messageText: message, emailSubject: subj, deliveryDetail: report }).catch(()=>{});
+      deliveryReport.push(report);
     }
 
-    return res.json({ success: true });
+    // Build summary for the admin UI
+    const sent    = deliveryReport.filter(r => r.telegram === 'sent' || r.email === 'sent').length;
+    const skipped = deliveryReport.filter(r => r.telegram && r.telegram.startsWith('skipped') && r.email && r.email.startsWith('skipped')).length;
+    const failed  = deliveryReport.length - sent - skipped;
+    console.log(`[CEE] Manual notification: ${sent} delivered, ${skipped} skipped (not linked), ${failed} failed`);
+    return res.json({ success: true, sent, skipped, failed, report: deliveryReport });
   } catch(e) { return res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -3062,6 +3148,12 @@ app.get('/diagnoseNotifications', async (req, res) => {
     diag.suggestions.push('Set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY in Railway to enable web push notifications — these were generated for you, check the session notes.');
   if (diag.players && diag.players.withPush === 0 && diag.webPush.vapidConfigured)
     diag.suggestions.push('VAPID is configured but no players have subscribed yet. They need to click "Enable Push Notifications" in the Player Hub Settings tab.');
+  if (diag.players && diag.players.total > 0 && diag.players.withTelegram === 0)
+    diag.suggestions.push(`⚠️ ${diag.players.total} registered player(s) but NONE have linked Telegram yet. They must message your bot with /start followed by their Player ID or gaming tag. Until they link, Telegram notifications go nowhere.`);
+  if (diag.players && diag.players.total > 0 && diag.players.withEmail === 0)
+    diag.suggestions.push(`⚠️ ${diag.players.total} registered player(s) but none have email in their profile. Check that registration form email field is saving correctly.`);
+  if (diag.players && diag.players.withTelegram > 0 && diag.players.withTelegram < diag.players.total)
+    diag.suggestions.push(`${diag.players.withTelegram} of ${diag.players.total} players have linked Telegram. Remaining ${diag.players.total - diag.players.withTelegram} players will NOT receive Telegram notifications until they message the bot with /start.`);
 
   return res.json({ ok: true, diag });
 });
@@ -3528,11 +3620,12 @@ app.post('/startNewSeason', async (req, res) => {
       return res.json({ success:false, message:`Season must be marked "complete" before starting a new one. Current status: "${currentSeason.status}".` });
 
     // ── Gather all data to archive ───────────────────────────────────────────────
-    const [playersSnap, fixturesSnap, regsSnap, standingsSnap] = await Promise.all([
+    const [playersSnap, fixturesSnap, regsSnap, standingsSnap, matchStatsSnap] = await Promise.all([
       db.collection('players').where('seasonId','==',currentId).get(),
       db.collection('fixtures').where('seasonId','==',currentId).get(),
       db.collection('registrations').where('seasonId','==',currentId).get(),
-      db.collection('standingsBroadcast').doc(currentId).get()
+      db.collection('standingsBroadcast').doc(currentId).get(),
+      db.collection('matchStats').where('seasonId','==',currentId).get()
     ]);
 
     const players  = []; playersSnap.forEach(d => players.push({ _id:d.id, ...d.data() }));
@@ -3564,6 +3657,9 @@ app.post('/startNewSeason', async (req, res) => {
     });
 
     // ── Write comprehensive archive document ─────────────────────────────────
+    const matchStatsDocs = [];
+    matchStatsSnap.forEach(d => matchStatsDocs.push({ _id:d.id, ...d.data() }));
+
     await db.collection('seasons_archive').doc(currentId).set({
       seasonId:         currentId,
       seasonData:       currentSeason,
@@ -3571,6 +3667,7 @@ app.post('/startNewSeason', async (req, res) => {
       fixtures,
       registrations:    regs,
       finalStandings:   standings,
+      matchStats:       matchStatsDocs,
       playstyleProfiles,
       integritySnapshot,
       intelligenceStats: {
@@ -3896,7 +3993,14 @@ app.post('/telegramWebhook', async (req, res) => {
       if (!found&&username){ const byTg=await db.collection('players').where('seasonId','==',seasonId)
         .where('telegramUsername','==',username.toLowerCase().replace('@','')).limit(1).get();
         if(!byTg.empty){const d=byTg.docs[0];found={id:d.id,...d.data()};} }
-      if (!found) { await sendTelegram(chatId,`❌ Tag <b>${tag}</b> not found. Double-check your gaming tag exactly as registered, or contact the admin.`); return; }
+      // Also search by Firestore doc ID (players copy their Player ID from the hub)
+      if (!found) {
+        try {
+          const byId = await db.collection('players').doc(tag).get();
+          if (byId.exists && byId.data().seasonId === seasonId) { found = { id: byId.id, ...byId.data() }; }
+        } catch(_) {}
+      }
+      if (!found) { await sendTelegram(chatId,`❌ <b>${tag}</b> not found.\n\nTry:\n• Your gaming tag (e.g. <code>VIPER</code>)\n• Your full Player ID from the hub\n\nContact admin if issue persists.`); return; }
       await db.collection('players').doc(found.id).update({ telegramChatId:chatId, telegramUsername:username, notificationsTelegram:true });
       await sendTelegram(chatId,
         `✅ <b>Telegram linked successfully!</b>\n\nYou'll now receive match notifications here for <b>${found.clubName||found.gameName}</b>.\n\nCommands:\n/status — your current season stats\n/fixtures — upcoming matches`);
@@ -3908,8 +4012,14 @@ app.post('/telegramWebhook', async (req, res) => {
       const snap=await db.collection('players').where('seasonId','==',seasonId).where('telegramChatId','==',chatId).limit(1).get();
       if (snap.empty){ await sendTelegram(chatId,'❌ Account not linked. Send /start YourTag'); return; }
       const p=snap.docs[0].data(), s=p.stats||{};
+      // Add returning player context
+      const returningNote = p.returningPlayer
+        ? `\n🔄 <i>Returning player — history tracked across seasons</i>\n`
+        + (p.integrityScore != null && p.integrityScore < 100 ? `Integrity: ${p.integrityScore}/100` : '')
+        : '';
+      const tierStr = p.playerTier ? ` | Tier: ${p.playerTier==='elite'?'🔴 Elite':p.playerTier==='mid'?'🟡 Mid':'⚪ Underdog'}` : '';
       await sendTelegram(chatId,
-        `📊 <b>${p.clubName||p.gameName}</b>\nRank: #${p.rank||'—'}\nPoints: ${s.pts||0}\nMP: ${s.mp||0} | W: ${s.w||0} D: ${s.d||0} L: ${s.l||0}\nGF: ${s.gf||0} GA: ${s.ga||0} GD: ${s.gd>=0?'+':''}${s.gd||0}`);
+        `📊 <b>${p.clubName||p.gameName}</b>\nRank: #${p.rank||'—'}${tierStr}\nPoints: ${s.pts||0}\nMP: ${s.mp||0} | W: ${s.w||0} D: ${s.d||0} L: ${s.l||0}\nGF: ${s.gf||0} GA: ${s.ga||0} GD: ${s.gd>=0?'+':''}${s.gd||0}${returningNote}`);
     }
     else if (text==='/fixtures') {
       const seasonId=await getSeasonId();
@@ -4811,7 +4921,9 @@ app.post('/analyzeOpponent', async (req, res) => {
     const cachedSnap = await db.collection('scoutReports').doc(reportDocId).get();
     let cachedReport = cachedSnap.exists ? cachedSnap.data() : null;
 
-    if (cachedReport && cachedReport.opponentLastMatchId === latestOppMatch._id) {
+    // Also mark stale if report predates cross-season H2H (check for h2hRecord in prompt)
+    const reportHasH2H = cachedReport && cachedReport.reportText && cachedReport.reportText.includes('H2H RECORD');
+    if (cachedReport && cachedReport.opponentLastMatchId === latestOppMatch._id && reportHasH2H) {
       return res.json({
         success: true,
         cached: true,
@@ -4823,7 +4935,7 @@ app.post('/analyzeOpponent', async (req, res) => {
       });
     }
 
-    // ── Fetch requesting player match history ───────────────────────────────
+    // ── Fetch requesting player match history (current + previous seasons) ──
     const myMatchSnap = await db.collection('matchStats')
       .where('playerId', '==', requestingPlayerId)
       .where('seasonId', '==', seasonId)
@@ -4833,14 +4945,57 @@ app.post('/analyzeOpponent', async (req, res) => {
     myMatchSnap.forEach(d => myMatches.push({ _id: d.id, ...d.data() }));
 
     // ── Fetch both player profiles ──────────────────────────────────────────
-    const [reqPlayerDoc, oppPlayerDoc, oppProfileDoc] = await Promise.all([
+    const [reqPlayerDoc, oppPlayerDoc, oppProfileDoc, reqProfileDoc] = await Promise.all([
       db.collection('players').doc(requestingPlayerId).get(),
       db.collection('players').doc(opponentPlayerId).get(),
-      db.collection('playerProfile').doc(opponentPlayerId).get()
+      db.collection('playerProfile').doc(opponentPlayerId).get(),
+      db.collection('playerProfile').doc(requestingPlayerId).get()
     ]);
     const reqPlayer  = reqPlayerDoc.exists  ? { id: reqPlayerDoc.id,  ...reqPlayerDoc.data()  } : { id: requestingPlayerId, clubName: 'Unknown', gameName: 'Unknown', stats: {} };
     const oppPlayer  = oppPlayerDoc.exists  ? { id: oppPlayerDoc.id,  ...oppPlayerDoc.data()  } : { id: opponentPlayerId, clubName: 'Unknown', gameName: 'Unknown', stats: {} };
     const oppProfile = oppProfileDoc.exists ? oppProfileDoc.data() : null;
+    const reqProfile = reqProfileDoc.exists ? reqProfileDoc.data() : null;
+
+    // ── Cross-season H2H between requesting player and opponent ─────────────
+    // Finds all matches across ALL seasons where these two faced each other,
+    // using linkedPreviousPlayerIds for accurate identity matching.
+    let h2hRecord = { wins:0, draws:0, losses:0, total:0, prevSeason:0, matches:[] };
+    try {
+      const myAllIds  = [requestingPlayerId, ...(reqPlayer.linkedPreviousPlayerIds || [])];
+      const oppAllIds = [opponentPlayerId,   ...(oppPlayer.linkedPreviousPlayerIds || [])];
+      const h2hSnap = await db.collection('matchStats')
+        .where('playerId', 'in', myAllIds.slice(0, 10))
+        .get();
+      h2hSnap.forEach(doc => {
+        const d = doc.data();
+        if (!oppAllIds.includes(d.opponentId)) return;
+        const isPrevSeason = d.seasonId !== seasonId;
+        h2hRecord.total++;
+        if (isPrevSeason) h2hRecord.prevSeason++;
+        if (d.result === 'W') h2hRecord.wins++;
+        else if (d.result === 'D') h2hRecord.draws++;
+        else h2hRecord.losses++;
+        h2hRecord.matches.push({
+          result: d.result, goalsFor: d.goalsFor, goalsAgainst: d.goalsAgainst,
+          seasonId: d.seasonId, matchDay: d.matchDay, isPrevSeason
+        });
+      });
+    } catch(h2hErr) { /* non-fatal */ }
+
+    // ── Pull requesting player's previous season matches if sparse this season ─
+    if (myMatches.length < 3) {
+      try {
+        const myLinkedIds = reqPlayer.linkedPreviousPlayerIds || [];
+        if (myLinkedIds.length > 0) {
+          const myPrevSnap = await db.collection('matchStats')
+            .where('playerId', 'in', myLinkedIds.slice(0, 10))
+            .orderBy('verifiedAt', 'desc')
+            .limit(5)
+            .get();
+          myPrevSnap.forEach(d => myMatches.push({ _id:d.id, ...d.data(), _prevSeason:true }));
+        }
+      } catch(e) { /* non-fatal */ }
+    }
 
     // ── Use last 5 opponent matches ─────────────────────────────────────────
     const oppMatches = allOppMatches.slice(-5);
@@ -5286,6 +5441,16 @@ REQUESTING PLAYER  : ${reqPlayer.clubName} (${reqPlayer.gameName})
 
 OPPONENT SCOUTED   : ${oppPlayer.clubName}
   Tier             : ${oppTierLabel}
+  Playstyle        : ${oppProfile ? oppProfile.fingerprintText || 'No fingerprint yet' : 'No profile yet'}
+
+YOUR PROFILE       : ${reqPlayer.clubName}
+  Playstyle        : ${reqProfile ? reqProfile.fingerprintText || 'No fingerprint yet' : 'No profile yet'}
+
+DIRECT H2H RECORD  : ${h2hRecord.total > 0
+  ? `${reqPlayer.clubName} vs ${oppPlayer.clubName} — ${h2hRecord.wins}W ${h2hRecord.draws}D ${h2hRecord.losses}L across ${h2hRecord.total} match(es)`
+    + (h2hRecord.prevSeason > 0 ? ` (${h2hRecord.prevSeason} from previous season — identity verified)` : '') 
+    + (h2hRecord.matches.slice(0,3).map(m => `\n  [${ m.isPrevSeason ? m.seasonId : 'this season' }] ${m.result} ${m.goalsFor}–${m.goalsAgainst} MD${m.matchDay||'?'}`).join(''))
+  : 'No previous meetings between these two players'}
 
 FIXTURE MATCHUP    : ${tierMatchup}
 
@@ -5344,6 +5509,7 @@ Requesting player : ${reqPlayer.clubName} | Formation: ${myFormation} | Attack: 
 Opponent scouted  : ${oppPlayer.clubName} | Matches analysed: ${matchesAnalysed}
 
 Every fix in the upgrade plan must be actionable for ${reqPlayer.clubName} specifically.
+H2H history: ${h2hRecord.total > 0 ? `${h2hRecord.wins}W ${h2hRecord.draws}D ${h2hRecord.losses}L in ${h2hRecord.total} meeting(s)` : 'First time meeting'}
 `;
 
     // ── Call 1 — Main Analysis ──────────────────────────────────────────────
@@ -5465,6 +5631,116 @@ MATCH ANALYSIS:
 // Output: winProbA (0–100), winProbB (0–100), drawProb (0–100), confidence
 // Probabilities only shown when BOTH players have 4+ verified matches.
 // ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /getPlayerH2H — cross-season head-to-head record between two players
+// Returns: aggregate record + per-match history across ALL seasons they've met
+// Works by:
+//   1. Current season matchStats with direct opponentId match
+//   2. Previous seasons via linkedPreviousPlayerIds on both player docs
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/getPlayerH2H', async (req, res) => {
+  const { myId, oppId, seasonId } = req.query;
+  if (!myId || !oppId || !seasonId) return res.status(400).json({ success:false, message:'Missing myId, oppId, seasonId' });
+
+  try {
+    // Fetch both player docs to get linkedPreviousPlayerIds
+    const [mySnap, oppSnap] = await Promise.all([
+      db.collection('players').doc(myId).get(),
+      db.collection('players').doc(oppId).get()
+    ]);
+    if (!mySnap.exists || !oppSnap.exists) return res.json({ success:false, message:'Player not found' });
+
+    const myData  = mySnap.data();
+    const oppData = oppSnap.data();
+
+    // Build full ID sets including all previous season identities
+    const myAllIds  = [myId,  ...(myData.linkedPreviousPlayerIds  || [])];
+    const oppAllIds = [oppId, ...(oppData.linkedPreviousPlayerIds || [])];
+
+    // Fetch all matchStats where I played vs the opponent (any identity, any season)
+    // We query by my player IDs and filter by opponent IDs
+    const allMatches = [];
+    const batchSize = 10; // Firestore 'in' limit
+
+    // Query in chunks if needed
+    for (let i = 0; i < myAllIds.length; i += batchSize) {
+      const chunk = myAllIds.slice(i, i + batchSize);
+      const snap = await db.collection('matchStats')
+        .where('playerId', 'in', chunk)
+        .get();
+      snap.forEach(doc => {
+        const d = doc.data();
+        // Only include if opponent is in the opponent's ID set
+        if (oppAllIds.includes(d.opponentId)) {
+          allMatches.push({ _id: doc.id, ...d });
+        }
+      });
+    }
+
+    if (!allMatches.length) {
+      return res.json({ success:true, hasData:false, wins:0, draws:0, losses:0, matches:[] });
+    }
+
+    // Sort by verifiedAt descending
+    allMatches.sort((a, b) => {
+      const ta = a.verifiedAt ? (a.verifiedAt._seconds || 0) : 0;
+      const tb = b.verifiedAt ? (b.verifiedAt._seconds || 0) : 0;
+      return tb - ta;
+    });
+
+    // Calculate aggregate stats
+    let wins = 0, draws = 0, losses = 0, gf = 0, ga = 0;
+    const matchList = [];
+
+    for (const m of allMatches) {
+      if (m.result === 'W') wins++;
+      else if (m.result === 'D') draws++;
+      else losses++;
+      gf += m.goalsFor   || 0;
+      ga += m.goalsAgainst || 0;
+
+      // Determine which season this match belongs to
+      const matchSeasonId = m.seasonId || 'unknown';
+      const isCurrent = matchSeasonId === seasonId;
+
+      // Get date string from verifiedAt
+      let dateStr = '';
+      if (m.verifiedAt) {
+        const ts = m.verifiedAt._seconds ? new Date(m.verifiedAt._seconds * 1000) : new Date(m.verifiedAt);
+        dateStr = ts.toLocaleDateString('en-GB', { day:'numeric', month:'short', year:'numeric' });
+      }
+
+      matchList.push({
+        result:    m.result,
+        goalsFor:  m.goalsFor  || 0,
+        goalsAgainst: m.goalsAgainst || 0,
+        matchDay:  m.matchDay  || null,
+        seasonId:  matchSeasonId,
+        isCurrent,
+        isHome:    m.isHome,
+        dateStr,
+        fixtureId: m.fixtureId || null
+      });
+    }
+
+    return res.json({
+      success:  true,
+      hasData:  true,
+      wins, draws, losses,
+      goalsFor: gf, goalsAgainst: ga,
+      totalMatches: allMatches.length,
+      currentSeasonMatches: allMatches.filter(m => m.seasonId === seasonId).length,
+      prevSeasonMatches:    allMatches.filter(m => m.seasonId !== seasonId).length,
+      matches: matchList
+    });
+
+  } catch(e) {
+    console.error('[CEE] getPlayerH2H:', e.message);
+    return res.status(500).json({ success:false, message: e.message });
+  }
+});
+
 app.get('/getMatchProbabilities', async (req, res) => {
   const { seasonId, fixtureId } = req.query;
   const sid = seasonId || await getSeasonId();
@@ -5651,27 +5927,54 @@ app.get('/getMatchProbabilities', async (req, res) => {
       const formTotal  = formScoreA + formScoreB;
       const formProbA  = formTotal > 0 ? formScoreA / formTotal : 0.5;
 
-      // ── COMPONENT 4: H2H with margin weighting (15%) ─────────────────────
+      // ── COMPONENT 4: H2H with margin weighting (15%) — cross-season aware ──
+      // Current season: direct opponentId match
       const h2hMatchesA = matchesA.filter(m => m.opponentId === pidB);
       const h2hMatchesB = matchesB.filter(m => m.opponentId === pidA);
+
+      // Previous seasons: look up via linkedPreviousPlayerIds on both player docs
+      const prevIdsA = (pA.linkedPreviousPlayerIds || []);
+      const prevIdsB = (pB.linkedPreviousPlayerIds || []);
+      // matchesA where opponentId is any of B's previous IDs (= prev season meetings)
+      const prevH2hA = prevIdsB.length
+        ? matchesA.filter(m => prevIdsB.includes(m.opponentId))
+        : [];
+      const prevH2hB = prevIdsA.length
+        ? matchesB.filter(m => prevIdsA.includes(m.opponentId))
+        : [];
+      // Also check B's previous IDs against A's previous matches
+      const allH2hA = [...h2hMatchesA, ...prevH2hA];
+      const allH2hB = [...h2hMatchesB, ...prevH2hB];
+
       let h2hProbA = 0.5;
-      const hasH2H = h2hMatchesA.length > 0 || h2hMatchesB.length > 0;
+      const hasH2H = allH2hA.length > 0 || allH2hB.length > 0;
       if (hasH2H) {
-        // Weight by margin: 3-0 win scores 1.35x vs 1-0 win
         let h2hScoreA = 0, h2hScoreB = 0, h2hTotalW = 0;
-        [...h2hMatchesA, ...h2hMatchesB].forEach(m => {
-          const isA = h2hMatchesA.includes(m);
-          const marginM = _marginMult(m.goalsFor, m.goalsAgainst, m.result);
+        allH2hA.forEach(m => {
+          // Previous season matches weighted at 60% to reflect recency
+          const seasMult = prevH2hA.includes(m) ? 0.6 : 1.0;
+          const marginM  = _marginMult(m.goalsFor, m.goalsAgainst, m.result);
           const baseScore = m.result === 'W' ? 1 : m.result === 'D' ? 0.4 : 0;
-          const weighted = baseScore * marginM;
-          if (isA) h2hScoreA += weighted; else h2hScoreB += weighted;
-          h2hTotalW += marginM;
+          h2hScoreA += baseScore * marginM * seasMult;
+          h2hTotalW += marginM * seasMult;
+        });
+        allH2hB.forEach(m => {
+          const seasMult = prevH2hB.includes(m) ? 0.6 : 1.0;
+          const marginM  = _marginMult(m.goalsFor, m.goalsAgainst, m.result);
+          const baseScore = m.result === 'W' ? 1 : m.result === 'D' ? 0.4 : 0;
+          h2hScoreB += baseScore * marginM * seasMult;
+          h2hTotalW += marginM * seasMult;
         });
         if (h2hTotalW > 0) {
           h2hProbA = h2hScoreA / (h2hScoreA + h2hScoreB + 0.001);
         }
       }
-      const h2hWeight     = hasH2H ? 0.15 : 0;
+      const h2hWeight = hasH2H ? 0.15 : 0;
+      // Build H2H record string for response (cross-season)
+      const h2hWinsA = allH2hA.filter(m => m.result === 'W').length;
+      const h2hDrawsA = allH2hA.filter(m => m.result === 'D').length;
+      const h2hLossesA = allH2hA.filter(m => m.result === 'L').length;
+      const prevMeetings = prevH2hA.length + prevH2hB.length;
 
       // ── COMPONENT 5: Possession + Shot quality control score (10%) ───────
       // High possession + clinical shooting = controlled dominance
@@ -5778,7 +6081,8 @@ app.get('/getMatchProbabilities', async (req, res) => {
         formA: recentA.map(m => m.result).join(''),
         formB: recentB.map(m => m.result).join(''),
         h2hRecord: hasH2H
-          ? `${h2hMatchesA.filter(m=>m.result==='W').length}W-${h2hMatchesA.filter(m=>m.result==='D').length}D-${h2hMatchesA.filter(m=>m.result==='L').length}L`
+          ? `${h2hWinsA}W-${h2hDrawsA}D-${h2hLossesA}L`
+            + (prevMeetings > 0 ? ` (incl. ${prevMeetings} prev season)` : '')
           : 'No H2H',
         // Expose component breakdown for transparency
         components: {
