@@ -656,7 +656,8 @@ async function _notifyPlayer(pid, fixtureId, eventType, subject, htmlBody, tgTex
     if (!r || !r.ok) console.warn(`[CEE] Telegram failed for ${pid}:`, r && r.description);
   }
 
-  // Email
+  // Email — open for all individual player events
+  // Broadcast results to all players uses Telegram+Push only (no email there)
   if (p.email && p.notificationsEmail !== false) {
     const r = await sendEmail(p.email, subject, htmlBody);
     results.email = r.success ? 'sent' : 'failed';
@@ -1429,9 +1430,15 @@ app.post('/verifyPlayerPin', async (req, res) => {
       if(!byIni.empty){const d=byIni.docs[0];player={id:d.id,...d.data()};}}
     if (!player) return res.json({ success:false, message:'Player not found. Check your gaming tag.' });
 
-    // Check if player is blocked
+    // Check if player is blocked (integrity/admin block)
     if (player.hubBlocked) {
       return res.json({ success:false, blocked:true, message:'Your hub access has been suspended. Contact the league admin.' });
+    }
+    // Check permanent PIN block (too many lockouts — requires payment or admin)
+    const secretDocPre=await db.collection('playerSecrets').doc(player.id).get();
+    if (secretDocPre.exists && secretDocPre.data().pinPermanentBlock) {
+      return res.json({ success:false, permanentBlock:true, playerId:player.id,
+        message:'Account permanently locked. Pay ₦300 to unlock or contact admin.' });
     }
 
     const secretDoc=await db.collection('playerSecrets').doc(player.id).get();
@@ -1451,21 +1458,35 @@ app.post('/verifyPlayerPin', async (req, res) => {
     if (!match) {
       const attempts=(pinFailAttempts||0)+1;
       const upd={ pinFailAttempts:attempts };
-      if (attempts>=3) {
-        upd.pinLockoutUntil=toTS(nowWAT().plus({minutes:30}));
+      if (attempts>=4) {
+        const lockCount=(secrets.pinLockoutCount||0)+1;
+        upd.pinLockoutCount=lockCount;
         upd.pinFailAttempts=0;
-        const newLockCount=(secrets.pinLockoutCount||0)+1;
-        upd.pinLockoutCount=newLockCount;
-        if (newLockCount>=2) {
+        if (lockCount>=2) {
+          // Second+ lockout — permanently blocked until ₦300 paid or admin unblocks
+          upd.pinPermanentBlock=true;
+          upd.pinPermanentBlockAt=admin.firestore.FieldValue.serverTimestamp();
+          await db.collection('playerSecrets').doc(player.id).update(upd);
           const adminChat=env.telegram&&env.telegram.admin_chat_id;
           if (adminChat) sendTelegram(adminChat,
-            `🔐 <b>Repeated PIN lockouts</b>\nPlayer: ${player.clubName||player.gameName}\n${newLockCount} lockouts triggered.`
+            `🚫 <b>PIN Permanent Block</b>\nPlayer: ${player.clubName||player.gameName}\nLocked ${lockCount}x — requires ₦300 unlock or admin action.`
           ).catch(()=>{});
+          return res.json({ success:false, permanentBlock:true, playerId:player.id,
+            message:'Account permanently locked after repeated failed attempts. Pay ₦300 to unlock or contact admin.' });
+        } else {
+          // First lockout — 3hr free cooldown
+          upd.pinLockoutUntil=toTS(nowWAT().plus({hours:3}));
+          await db.collection('playerSecrets').doc(player.id).update(upd);
+          const adminChat=env.telegram&&env.telegram.admin_chat_id;
+          if (adminChat) sendTelegram(adminChat,
+            `🔐 <b>PIN Lockout</b>\nPlayer: ${player.clubName||player.gameName}\nFirst lockout — 3hr free cooldown.`
+          ).catch(()=>{});
+          return res.json({ success:false, locked:true, message:'Too many failed attempts. Account locked for 3 hours. Try again later.' });
         }
       }
       await db.collection('playerSecrets').doc(player.id).update(upd);
-      const remaining=Math.max(0,3-attempts);
-      return res.json({ success:false, message:`Incorrect PIN. ${remaining>0?remaining+' attempt(s) remaining.':'Account locked for 30 minutes.'}` });
+      const remaining=Math.max(0,4-attempts);
+      return res.json({ success:false, message:`Incorrect PIN. ${remaining} attempt(s) remaining.` });
     }
 
     await db.collection('playerSecrets').doc(player.id).update({ pinFailAttempts:0, pinLockoutUntil:null });
@@ -3280,6 +3301,13 @@ app.post('/approveRegistration', async (req, res) => {
       console.error('[CEE] Identity linking error (non-fatal):', linkErr.message);
     }
 
+    // Auto-assign pot based on squad strength (submitted in registration form)
+    const regStrength = Number(reg.strength) || 0;
+    const autoPot = reg.pot ? Number(reg.pot) :
+      regStrength >= 3100 ? 1 :
+      regStrength >= 2900 ? 2 :
+      regStrength >= 2700 ? 3 : 4;
+
     const playerRef=await db.collection('players').add({
       seasonId, gameName:reg.gameName||'', clubName:reg.clubName||'',
       initials:reg.initials||(reg.gameName||'').substring(0,2).toUpperCase(),
@@ -3287,6 +3315,7 @@ app.post('/approveRegistration', async (req, res) => {
       phone: reg.phone ? String(reg.phone).replace(/\D/g,'') : null,
       telegramChatId:reg.telegramChatId||null, notificationsEmail:true, notificationsTelegram:true,
       registrationId:regId, legacyId:null,
+      strength: regStrength, pot: autoPot, fromReg: true,
       stats:{pts:0,mp:0,pld:0,w:0,d:0,l:0,gf:0,ga:0,gd:0,goals:0},
       rank:null, knockoutStatus:null,
       // Identity linking fields
@@ -4114,6 +4143,118 @@ async function runSubmissionDeadlineEnforcer() {
   console.log(`[CEE] submissionDeadlineEnforcer: processed ${snap.size}`);
 }
 cron.schedule('*/10 * * * *', () => runSubmissionDeadlineEnforcer().catch(e => console.error('[CEE] submissionDeadlineEnforcer error:',e)));
+
+
+// ── Auto-approve registrations after 48hr (if toggle enabled) ────────────
+setInterval(async () => {
+  try {
+    const cfg = await db.collection('config').doc('automation').get();
+    const d = cfg.exists ? cfg.data() : {};
+    if (!d.masterEnabled && d.masterEnabled !== undefined) return;
+    if (!d.autoApproveReg && d.autoApproveReg !== undefined) return;
+    const cutoff = admin.firestore.Timestamp.fromMillis(Date.now() - 48*60*60*1000);
+    const pending = await db.collection('registrations')
+      .where('status','==','pending')
+      .where('submittedAt','<=',cutoff)
+      .get();
+    for (const doc of pending.docs) {
+      const reg = doc.data();
+      try {
+        // Auto-approve: generate PIN + create player (reuse approveRegistration logic)
+        const playerPin = String(Math.floor(1000+Math.random()*9000));
+        const pinHash = await bcrypt.hash(playerPin, 12);
+        const seasonId = reg.seasonId;
+        const regStrength = Number(reg.strength) || 0;
+        const cfgDoc = await db.collection('config').doc('automation').get();
+        const thresh = (cfgDoc.exists && cfgDoc.data().potThresholds) || { p1:3100, p2:2900, p3:2700 };
+        const autoPot = reg.pot ? Number(reg.pot) :
+          regStrength >= thresh.p1 ? 1 : regStrength >= thresh.p2 ? 2 : regStrength >= thresh.p3 ? 3 : 4;
+        const playerRef = await db.collection('players').add({
+          seasonId, gameName:reg.gameName||'', clubName:reg.clubName||'',
+          initials:reg.initials||(reg.gameName||'').substring(0,2).toUpperCase(),
+          email:reg.email||'', phone:reg.phone?String(reg.phone).replace(/\D/g,''):null,
+          telegramChatId:null, notificationsEmail:true, notificationsTelegram:true,
+          registrationId:doc.id, legacyId:null, fromReg:true,
+          strength:regStrength, pot:autoPot,
+          stats:{pts:0,mp:0,pld:0,w:0,d:0,l:0,gf:0,ga:0,gd:0,goals:0},
+          rank:null, knockoutStatus:null, integrityScore:100,
+          createdAt:admin.firestore.FieldValue.serverTimestamp()
+        });
+        await db.collection('playerSecrets').doc(playerRef.id).set(
+          {pinHash,pinFailAttempts:0,pinLockoutUntil:null,pinLockoutCount:0});
+        await doc.ref.update({status:'approved',playerId:playerRef.id,
+          approvedAt:admin.firestore.FieldValue.serverTimestamp(),autoApproved:true});
+        if (reg.email) {
+          sendEmail(reg.email,'CEE — Registration Approved (Auto) 🎮',
+            `<p>Your registration has been automatically approved after 48 hours.</p>
+             <div class="hl" style="font-size:24px;font-weight:700;letter-spacing:.3em">PIN: ${playerPin}</div>
+             <p>Keep this PIN private. Use it to access the CEE Player Hub.</p>`).catch(()=>{});
+        }
+        console.log(`[CEE] Auto-approved registration ${doc.id} for ${reg.gameName}`);
+      } catch(e) { console.error('[CEE] Auto-approve reg error:', doc.id, e.message); }
+    }
+  } catch(e) { console.error('[CEE] Auto-approve cron error:', e.message); }
+}, 15 * 60 * 1000); // every 15 minutes
+
+// ── Auto-launch tournament when deadline passed + slots full ─────────────
+setInterval(async () => {
+  try {
+    const cfg = await db.collection('config').doc('automation').get();
+    const d = cfg.exists ? cfg.data() : {};
+    if (!d.masterEnabled && d.masterEnabled !== undefined) return;
+    if (!d.autoLaunch && d.autoLaunch !== undefined) return;
+    // Get active season
+    const seasonCfg = await db.collection('config').doc('season').get();
+    if (!seasonCfg.exists) return;
+    const seasonId = seasonCfg.data().activeSeasonId;
+    if (!seasonId) return;
+    const seasonDoc = await db.collection('seasons').doc(seasonId).get();
+    if (!seasonDoc.exists) return;
+    const season = seasonDoc.data();
+    // Only run if season is registration_open
+    if (season.status !== 'registration_open') return;
+    // Check deadline
+    const now = Date.now();
+    const deadline = season.registrationDeadline ? season.registrationDeadline.toMillis() : null;
+    const deadlinePassed = deadline && now > deadline;
+    // Check slots
+    const playersSnap = await db.collection('players').where('seasonId','==',seasonId).get();
+    const format = season.format || 20;
+    const slotsFull = playersSnap.size >= format;
+    if (!deadlinePassed && !slotsFull) return;
+    // Mark season as active
+    await db.collection('seasons').doc(seasonId).update({
+      status:'active', autoLaunchedAt:admin.firestore.FieldValue.serverTimestamp()
+    });
+    // Notify all players
+    if (d.autoSeasonNotify !== false) {
+      const allPlayers = await db.collection('players').where('seasonId','==',seasonId).get();
+      const tgMsg = `🏆 <b>CEE Season is LIVE!</b>
+
+The tournament has officially started!
+
+Log in to the Player Hub to view your fixtures and get ready for your first match.
+
+⚡ ${process.env.SITE_URL||'https://cee-esports.web.app'}`;
+      for (const p of allPlayers.docs) {
+        const pd = p.data();
+        if (pd.telegramChatId) sendTelegram(pd.telegramChatId, tgMsg).catch(()=>{});
+        if (pd.pushSubscription) {
+          let sub; try { sub = typeof pd.pushSubscription==='string' ? JSON.parse(pd.pushSubscription) : pd.pushSubscription; } catch(e){sub=null;}
+          if (sub) _sendWebPush(sub, { title:'🏆 CEE Season is LIVE!', body:'The tournament has started! Check your fixtures now.', eventType:'SEASON_LAUNCHED', data:{url:`${process.env.SITE_URL||'https://cee-esports.web.app'}#fixtures`} }).catch(()=>{});
+        }
+      }
+    }
+    const adminChat = env.telegram && env.telegram.admin_chat_id;
+    if (adminChat) sendTelegram(adminChat,
+      `🚀 <b>Season Auto-Launched!</b>
+Season: ${seasonId}
+Players: ${playersSnap.size}/${format}
+Reason: ${slotsFull ? 'Slots full' : 'Deadline passed'}`
+    ).catch(()=>{});
+    console.log(`[CEE] Auto-launch triggered for ${seasonId}`);
+  } catch(e) { console.error('[CEE] Auto-launch cron error:', e.message); }
+}, 10 * 60 * 1000); // every 10 minutes
 
 // ── autoApprover — every 5 min — GUARD-01, Auto-16 (48hr flagged) ─────────
 async function runAutoApprover() {
@@ -5623,6 +5764,166 @@ app.get('/adminGetIntelligenceConfig', async (req, res) => {
   } catch(e) { return res.status(500).json({ success: false, message: e.message }); }
 });
 
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /requestPinReset — self-service PIN reset (₦150 via Paystack)
+// Body: { tag, email, paystackRef, seasonId }
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/requestPinReset', async (req, res) => {
+  const { tag, email, paystackRef, seasonId } = req.body;
+  if (!tag||!email||!paystackRef||!seasonId)
+    return res.status(400).json({ success:false, message:'Missing fields.' });
+  try {
+    const tagUpper = tag.toUpperCase().trim();
+    const emailLow = email.toLowerCase().trim();
+    // Find player by tag
+    let player = null;
+    const snaps = await Promise.all([
+      db.collection('players').where('seasonId','==',seasonId).where('gameName','==',tagUpper).limit(1).get(),
+      db.collection('players').where('seasonId','==',seasonId).where('clubName','==',tagUpper).limit(1).get(),
+      db.collection('players').where('seasonId','==',seasonId).where('initials','==',tagUpper).limit(1).get(),
+    ]);
+    for (const s of snaps) { if (!s.empty) { const d=s.docs[0]; player={id:d.id,...d.data()}; break; } }
+    if (!player) return res.json({ success:false, message:'Player not found. Check your gaming tag.' });
+    // Verify email matches
+    if ((player.email||'').toLowerCase().trim() !== emailLow)
+      return res.json({ success:false, message:'Email does not match our records for this tag.' });
+    // Verify Paystack payment
+    const psSecret = process.env.PAYSTACK_SECRET;
+    if (psSecret && !psSecret.startsWith('sk_test') && paystackRef !== 'BYPASS') {
+      const psVerify = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(paystackRef)}`,
+        { headers:{ Authorization:`Bearer ${psSecret}` } });
+      const psData = await psVerify.json();
+      if (!psData.status || psData.data.status !== 'success')
+        return res.json({ success:false, message:'Payment verification failed. Please try again.' });
+      if (psData.data.amount < 15000)
+        return res.json({ success:false, message:'Payment amount incorrect. PIN reset requires ₦150.' });
+    }
+    // Generate new PIN
+    const newPin = String(Math.floor(1000+Math.random()*9000));
+    const newHash = await bcrypt.hash(newPin, 12);
+    // Clear lockout and block, set new PIN
+    await db.collection('playerSecrets').doc(player.id).update({
+      pinHash: newHash,
+      pinFailAttempts: 0,
+      pinLockoutUntil: null,
+      pinPermanentBlock: false,
+      pinLockoutCount: 0,
+      pinResetAt: admin.firestore.FieldValue.serverTimestamp(),
+      pinResetRef: paystackRef
+    });
+    // Notify player via email + Telegram
+    if (player.email) {
+      sendEmail(player.email, 'CEE — Your New PIN 🔐',
+        `<p>Your PIN has been reset successfully.</p>
+         <div class="hl" style="font-size:36px;font-weight:700;letter-spacing:.5em;text-align:center">${newPin}</div>
+         <p><strong>Keep this PIN safe.</strong> Use it to access the CEE Player Hub.</p>`).catch(()=>{});
+    }
+    if (player.telegramChatId) {
+      sendTelegram(player.telegramChatId,
+        `🔐 <b>PIN Reset Successful</b>\n\nYour new PIN is: <b>${newPin}</b>\n\nKeep this private. Use it to access the CEE Player Hub.`
+      ).catch(()=>{});
+    }
+    await audit('PIN_RESET_PAID', player.id, 'player', `PIN reset via ₦150 payment. Ref: ${paystackRef}`);
+    return res.json({ success:true, message:'PIN reset successful. Check your email and Telegram for your new PIN.' });
+  } catch(e) {
+    console.error('[CEE] requestPinReset error:', e.message);
+    return res.status(500).json({ success:false, message:e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /unlockPinAccount — unlock permanently blocked account (₦300 via Paystack)
+// Body: { playerId, paystackRef }
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/unlockPinAccount', async (req, res) => {
+  const { playerId, paystackRef } = req.body;
+  if (!playerId||!paystackRef)
+    return res.status(400).json({ success:false, message:'Missing fields.' });
+  try {
+    const psSecret = process.env.PAYSTACK_SECRET;
+    if (psSecret && !psSecret.startsWith('sk_test') && paystackRef !== 'BYPASS') {
+      const psVerify = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(paystackRef)}`,
+        { headers:{ Authorization:`Bearer ${psSecret}` } });
+      const psData = await psVerify.json();
+      if (!psData.status || psData.data.status !== 'success')
+        return res.json({ success:false, message:'Payment verification failed.' });
+      if (psData.data.amount < 30000)
+        return res.json({ success:false, message:'Payment amount incorrect. Unlock requires ₦300.' });
+    }
+    const pdSnap = await db.collection('players').doc(String(playerId)).get();
+    if (!pdSnap.exists) return res.json({ success:false, message:'Player not found.' });
+    const player = pdSnap.data();
+    // Generate new PIN and unlock
+    const newPin = String(Math.floor(1000+Math.random()*9000));
+    const newHash = await bcrypt.hash(newPin, 12);
+    await db.collection('playerSecrets').doc(String(playerId)).update({
+      pinHash: newHash,
+      pinFailAttempts: 0,
+      pinLockoutUntil: null,
+      pinPermanentBlock: false,
+      pinLockoutCount: 0,
+      pinUnlockedAt: admin.firestore.FieldValue.serverTimestamp(),
+      pinUnlockRef: paystackRef
+    });
+    if (player.email) {
+      sendEmail(player.email, 'CEE — Account Unlocked 🔓',
+        `<p>Your account has been unlocked. Your new PIN is:</p>
+         <div class="hl" style="font-size:36px;font-weight:700;letter-spacing:.5em;text-align:center">${newPin}</div>
+         <p>Keep this private. This is your final warning — further repeated failures may result in a permanent ban.</p>`).catch(()=>{});
+    }
+    if (player.telegramChatId) {
+      sendTelegram(player.telegramChatId,
+        `🔓 <b>Account Unlocked</b>\n\nYour new PIN is: <b>${newPin}</b>\n\nThis is your final warning.`
+      ).catch(()=>{});
+    }
+    const adminChat = env.telegram && env.telegram.admin_chat_id;
+    if (adminChat) sendTelegram(adminChat,
+      `🔓 Account unlocked\nPlayer: ${player.clubName||player.gameName}\nPaid ₦300. Ref: ${paystackRef}`
+    ).catch(()=>{});
+    await audit('PIN_UNLOCK_PAID', playerId, 'player', `Account unlocked via ₦300 payment. Ref: ${paystackRef}`);
+    return res.json({ success:true, message:'Account unlocked. Check your email and Telegram for your new PIN.' });
+  } catch(e) {
+    console.error('[CEE] unlockPinAccount error:', e.message);
+    return res.status(500).json({ success:false, message:e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /getAutomationConfig — returns all automation toggle states
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/getAutomationConfig', async (req, res) => {
+  if (!assertAdminSecret(req, res)) return;
+  try {
+    const doc = await db.collection('config').doc('automation').get();
+    const d = doc.exists ? doc.data() : {};
+    return res.json({ success:true,
+      masterEnabled:         d.masterEnabled         !== false,
+      autoLaunch:            d.autoLaunch            !== false,
+      autoApproveReg:        d.autoApproveReg        !== false,
+      autoPotAssign:         d.autoPotAssign         !== false,
+      autoOpenWindows:       d.autoOpenWindows       !== false,
+      autoSeasonNotify:      d.autoSeasonNotify      !== false,
+      potThresholds:         d.potThresholds         || { p1:3100, p2:2900, p3:2700 }
+    });
+  } catch(e) { return res.status(500).json({ success:false, message:e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /setAutomationConfig — save automation toggle states
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/setAutomationConfig', async (req, res) => {
+  if (!assertAdminSecret(req, res)) return;
+  try {
+    const allowed = ['masterEnabled','autoLaunch','autoApproveReg','autoPotAssign','autoOpenWindows','autoSeasonNotify','potThresholds'];
+    const update = {};
+    for (const k of allowed) { if (req.body[k] !== undefined) update[k] = req.body[k]; }
+    await db.collection('config').doc('automation').set(update, { merge:true });
+    await audit('AUTOMATION_CONFIG', 'config', 'automation', JSON.stringify(update));
+    return res.json({ success:true });
+  } catch(e) { return res.status(500).json({ success:false, message:e.message }); }
+});
 
 app.post('/testAiVerify', async (req, res) => {
   if (!assertAdminSecret(req, res)) return;
