@@ -4164,6 +4164,66 @@ app.post('/telegramWebhook', async (req, res) => {
         + `<code>/start YourPlayerID</code> (from the hub)\n\n`
         + `Visit the CEE Player Hub for match details, fixtures and scores.`);
     }
+    else if (!text.startsWith('/')) {
+      // Plain text — player probably sent their tag or Player ID as a separate message
+      // (common mistake: hub says 'enter your Player ID' so they paste it without /start)
+      // Try to link them directly, just like /start TAG
+      const seasonId = await getSeasonId();
+      if (!seasonId) { await sendTelegram(chatId, '⚠️ No active season found. Try again later.'); return; }
+
+      // Check if already linked
+      const alreadySnap = await db.collection('players')
+        .where('seasonId','==',seasonId).where('telegramChatId','==',chatId).limit(1).get();
+      if (!alreadySnap.empty) {
+        const p = alreadySnap.docs[0].data();
+        await sendTelegram(chatId,
+          `✅ Already linked as <b>${p.clubName||p.gameName}</b>!\n\nUse /status or /fixtures to check your account.`);
+        return;
+      }
+
+      const tagUpper = text.toUpperCase();
+      let found = null;
+
+      // Search by gameName
+      const byGN = await db.collection('players').where('seasonId','==',seasonId).where('gameName','==',tagUpper).limit(1).get();
+      if (!byGN.empty) { const d=byGN.docs[0]; found={id:d.id,...d.data()}; }
+
+      // Search by clubName
+      if (!found) { const byCN = await db.collection('players').where('seasonId','==',seasonId).where('clubName','==',tagUpper).limit(1).get();
+        if (!byCN.empty) { const d=byCN.docs[0]; found={id:d.id,...d.data()}; } }
+
+      // Search by Firestore doc ID (exact match — player pasted their ID from hub)
+      if (!found) { try { const byId = await db.collection('players').doc(text).get();
+        if (byId.exists && byId.data().seasonId===seasonId) found={id:byId.id,...byId.data()}; } catch(_){} }
+
+      // Search by telegram username
+      if (!found && username) { const byTg = await db.collection('players').where('seasonId','==',seasonId)
+        .where('telegramUsername','==',username.toLowerCase().replace('@','')).limit(1).get();
+        if (!byTg.empty) { const d=byTg.docs[0]; found={id:d.id,...d.data()}; } }
+
+      if (!found) {
+        await sendTelegram(chatId,
+          `❌ <b>${text}</b> not found.\n\n`
+          + `Make sure you send your exact gaming tag or the Player ID shown in your hub.\n\n`
+          + `Example: if your tag is VIPER, send:\n<code>/start VIPER</code>\nor just send: <code>VIPER</code>`);
+        return;
+      }
+
+      // Link!
+      await db.collection('players').doc(found.id).update({ telegramChatId:chatId, telegramUsername:username, notificationsTelegram:true });
+      const s = found.stats || {};
+      const tierLine = found.playerTier ? `\nTier: ${found.playerTier==='elite'?'🔴 Elite':found.playerTier==='mid'?'🟡 Mid':'⚪ Underdog'}` : '';
+      await sendTelegram(chatId,
+        `✅ <b>You're linked! Welcome to CEE.</b>\n\n`
+        + `🎮 <b>${found.clubName||found.gameName}</b>${found.pot ? ' · P'+found.pot : ''}${tierLine}\n`
+        + (s.mp > 0 ? `Season record: ${s.mp} played · ${s.w}W ${s.d}D ${s.l}L · ${s.pts} pts` : 'Season record: No matches yet')
+        + `\n\n🔔 You'll now receive match alerts here.\n`
+        + `/status · /fixtures · /help`);
+      const adminChat = env.telegram && env.telegram.admin_chat_id;
+      if (adminChat) await sendTelegram(adminChat,
+        `📱 <b>Player linked</b>\n${found.clubName||found.gameName} (@${username||'no username'})${found.pot?` · P${found.pot}`:''}`).catch(()=>{});
+      await audit('TELEGRAM_LINKED', found.id, 'player', `ChatId ${chatId} linked via plain text`).catch(()=>{});
+    }
   } catch(e){ console.error('[CEE] telegramWebhook:',e.message); }
 });
 
@@ -6693,9 +6753,7 @@ app.listen(PORT, () => {
   console.log(`[CEE] ✅ Backend running on port ${PORT}`);
   console.log(`[CEE] URL: https://campus-esports-elite-backend2-production.up.railway.app`);
   // Load tokens from Firestore adminSettings (bridges admin UI → backend runtime)
-  // This allows admin to save TELEGRAM_TOKEN + Brevo keys via the Season Clock UI
-  // without needing to set Railway env vars manually
-  _loadTokensFromFirestore().then(() => {
+  _loadTokensFromFirestore().then(async () => {
     // Re-run env check after Firestore token load
     const tgOk = !!(env.telegram && env.telegram.token);
     const brevoOk = _brevoAccounts.length > 0;
@@ -6703,6 +6761,22 @@ app.listen(PORT, () => {
     else         console.warn('[CEE] ⚠️  Telegram: no token — set TELEGRAM_TOKEN in Railway or save via Season Clock → API Keys');
     if (brevoOk) console.log(`[CEE] ✅ Brevo: ${_brevoAccounts.length} account(s) ready — ${_brevoAccounts.length * 295} emails/day`);
     else         console.warn('[CEE] ⚠️  Brevo: no accounts — set BREVO_KEY_1+BREVO_FROM_1 in Railway or save via Season Clock → API Keys');
+
+    // Auto-set Telegram webhook on every startup so it survives redeploys
+    if (tgOk) {
+      try {
+        const domain = process.env.RAILWAY_PUBLIC_DOMAIN
+          || process.env.RAILWAY_STATIC_URL
+          || 'campus-esports-elite-backend2-production.up.railway.app';
+        const webhookUrl = `https://${domain.replace(/^https?:\/\//, '')}/telegramWebhook`;
+        const whRes = await fetch(
+          `https://api.telegram.org/bot${env.telegram.token}/setWebhook?url=${encodeURIComponent(webhookUrl)}`
+        );
+        const whData = await whRes.json();
+        if (whData.ok) console.log(`[CEE] ✅ Telegram webhook auto-set to ${webhookUrl}`);
+        else           console.warn('[CEE] ⚠️  Telegram webhook auto-set failed:', whData.description);
+      } catch(e) { console.warn('[CEE] Webhook auto-set error:', e.message); }
+    }
   }).catch(() => {});
   // Startup env check — show what's configured and what's missing
   const checks = {
