@@ -6368,6 +6368,30 @@ app.get('/getScoutReport', async (req, res) => {
   }
 });
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /sendMatchWindowNotification — fires notifications for a specific fixture event
+// Called by admin frontend when manually opening/closing windows
+// type: WINDOW_OPEN | WINDOW_CLOSED | RESULT_APPROVED
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/sendMatchWindowNotification', async (req, res) => {
+  if (!assertAdminSecret(req, res)) return;
+  const { fixtureId, type, seasonId } = req.body;
+  if (!fixtureId || !type) return res.status(400).json({ success: false, message: 'fixtureId and type required' });
+  try {
+    const sid = seasonId || await getSeasonId();
+    const fixSnap = await db.collection('fixtures').doc(fixtureId).get();
+    if (!fixSnap.exists) return res.json({ success: false, message: 'Fixture not found' });
+    const fix = fixSnap.data();
+    await _sendMatchNotifications(type, fixtureId, fix.playerAId, fix.playerBId, sid);
+    console.log(`[CEE] Manual ${type} notification sent for fixture ${fixtureId}`);
+    return res.json({ success: true });
+  } catch(e) {
+    console.error('[CEE] sendMatchWindowNotification:', e.message);
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════
 // POST /approveResult — Admin approves a match result
