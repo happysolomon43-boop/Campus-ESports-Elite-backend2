@@ -340,6 +340,63 @@ _initVapid();
   }
 })();
 
+// ── Load tokens from Firestore if not set in Railway env vars ──────────────
+// Admin can save TELEGRAM_TOKEN and BREVO keys via Season Clock → API Keys.
+// This function bridges: admin UI → Firestore adminSettings → backend runtime.
+// Runs once after Firestore is ready. Safe to run even if keys are already set.
+async function _loadTokensFromFirestore() {
+  try {
+    const doc = await db.collection('config').doc('adminSettings').get();
+    if (!doc.exists) return;
+    const d = doc.data();
+
+    // Telegram token
+    if (!env.telegram.token && d.tgToken && /^\d+:[A-Za-z0-9_-]{20,}$/.test(d.tgToken)) {
+      env.telegram.token = d.tgToken;
+      console.log('[CEE] ✅ TELEGRAM_TOKEN loaded from Firestore adminSettings');
+      // Auto-set webhook so players can link immediately
+      try {
+        const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_STATIC_URL;
+        if (railwayDomain) {
+          const webhookUrl = `https://${railwayDomain}/telegramWebhook`;
+          fetch(`https://api.telegram.org/bot${d.tgToken}/setWebhook?url=${encodeURIComponent(webhookUrl)}`)
+            .then(r => r.json())
+            .then(res => { if (res.ok) console.log('[CEE] ✅ Telegram webhook auto-set to', webhookUrl); })
+            .catch(() => {});
+        }
+      } catch(e) { /* non-fatal */ }
+    }
+    // Telegram bot username
+    if (d.tgBotUsername) {
+      env.telegram.botUsername = d.tgBotUsername;
+    }
+
+    // Brevo accounts — load if not already configured from env vars
+    if (_brevoAccounts.length === 0) {
+      // Try Firestore-saved Brevo keys
+      for (let i = 1; i <= 4; i++) {
+        const key  = d[`brevoKey${i}`];
+        const from = d[`brevoFrom${i}`];
+        const name = d[`brevoName${i}`] || 'CEE League';
+        if (key && from) {
+          _brevoAccounts.push({ key, from, name, sentToday: 0, lastResetDate: '' });
+          console.log(`[CEE] ✅ Brevo account ${i} loaded from Firestore adminSettings (${from})`);
+        }
+      }
+    }
+
+    // Admin email
+    if (!env.admin.email && d.adminEmail) {
+      env.admin.email = d.adminEmail;
+      console.log('[CEE] ✅ ADMIN_EMAIL loaded from Firestore adminSettings');
+    }
+
+  } catch(e) {
+    console.warn('[CEE] Could not load tokens from Firestore (non-fatal):', e.message);
+  }
+}
+
+
 // ── Express app ───────────────────────────────────────────────────────────
 const app = express();
 // Handle CORS preflight for ALL routes (must be before any route definitions)
@@ -3101,12 +3158,15 @@ app.get('/diagnoseNotifications', async (req, res) => {
       accountCount: _brevoAccounts.length,
       accounts: _brevoAccounts.map(a => ({ from: a.from, sentToday: a.sentToday, remaining: Math.max(0, 295 - a.sentToday) })),
       dailyCapacity: _brevoAccounts.length * 295,
-      adminEmailSet: !!(env.admin && env.admin.email)
+      adminEmailSet: !!(env.admin && env.admin.email),
+      source: process.env.BREVO_KEY_1 ? 'railway_env' : (_brevoAccounts.length > 0 ? 'firestore_adminSettings' : 'not_configured')
     },
     telegram: {
       tokenConfigured: !!(env.telegram && env.telegram.token),
       adminChatIdSet:  !!(env.telegram && env.telegram.admin_chat_id),
-      tokenPreview: env.telegram && env.telegram.token ? env.telegram.token.substring(0,8) + '...' : null
+      tokenPreview: env.telegram && env.telegram.token ? env.telegram.token.substring(0,8) + '...' : null,
+      source: process.env.TELEGRAM_TOKEN ? 'railway_env' : (env.telegram && env.telegram.token ? 'firestore_adminSettings' : 'not_configured'),
+      webhookNote: 'Webhook must be set via admin panel → Season Clock → Set Telegram Webhook button'
     },
     whatsapp: {
       note: 'WhatsApp notifications use the admin as a relay. Players with whatsappNumber set will have messages queued in the notification log for admin to forward.'
@@ -3154,6 +3214,27 @@ app.get('/diagnoseNotifications', async (req, res) => {
     diag.suggestions.push(`⚠️ ${diag.players.total} registered player(s) but none have email in their profile. Check that registration form email field is saving correctly.`);
   if (diag.players && diag.players.withTelegram > 0 && diag.players.withTelegram < diag.players.total)
     diag.suggestions.push(`${diag.players.withTelegram} of ${diag.players.total} players have linked Telegram. Remaining ${diag.players.total - diag.players.withTelegram} players will NOT receive Telegram notifications until they message the bot with /start.`);
+
+  // Check if webhook is set — this is the most common reason Telegram linking fails
+  if (diag.telegram.tokenConfigured) {
+    try {
+      const whSnap = await fetch(`https://api.telegram.org/bot${env.telegram.token}/getWebhookInfo`);
+      const whData = await whSnap.json();
+      if (whData.ok && whData.result) {
+        const wh = whData.result;
+        diag.telegram.webhookUrl = wh.url || null;
+        diag.telegram.webhookPending = wh.pending_update_count || 0;
+        diag.telegram.webhookLastError = wh.last_error_message || null;
+        if (!wh.url) {
+          diag.suggestions.push('🔴 CRITICAL: Telegram webhook is NOT set. Players cannot link their accounts and you will not receive notifications. Click "Set Webhook" in the admin panel → Season Clock → Notifications tab.');
+        } else if (wh.last_error_message) {
+          diag.suggestions.push(`⚠️ Telegram webhook has errors: "${wh.last_error_message}". This may be causing message delivery failures.`);
+        } else if (wh.pending_update_count > 10) {
+          diag.suggestions.push(`ℹ️ Telegram has ${wh.pending_update_count} pending unprocessed updates. Check Railway logs for errors.`);
+        }
+      }
+    } catch(e) { /* non-fatal webhook check */ }
+  }
 
   return res.json({ ok: true, diag });
 });
@@ -3457,7 +3538,10 @@ app.post('/approveRegistration', async (req, res) => {
     }
     await logNotif(null,playerRef.id,'email','REGISTRATION_APPROVED','sent');
     await audit('REGISTRATION_APPROVED',regId,'registration',`Player created: ${playerRef.id}`);
-    return res.json({ success:true, playerId:playerRef.id });
+    // Return full player data so frontend immediately updates Players tab
+    const newPlayerDoc = await playerRef.get();
+    const playerData = newPlayerDoc.exists ? { _id: newPlayerDoc.id, ...newPlayerDoc.data() } : null;
+    return res.json({ success:true, playerId: playerRef.id, player: playerData });
   } catch(e){ console.error('[CEE] approveRegistration:',e); return res.status(500).json({ success:false, message:e.message }); }
 });
 
@@ -4002,8 +4086,41 @@ app.post('/telegramWebhook', async (req, res) => {
       }
       if (!found) { await sendTelegram(chatId,`❌ <b>${tag}</b> not found.\n\nTry:\n• Your gaming tag (e.g. <code>VIPER</code>)\n• Your full Player ID from the hub\n\nContact admin if issue persists.`); return; }
       await db.collection('players').doc(found.id).update({ telegramChatId:chatId, telegramUsername:username, notificationsTelegram:true });
+
+      // Fetch player stats for a personalised welcome
+      const s = found.stats || {};
+      const tier = found.playerTier
+        ? (found.playerTier==='elite' ? '🔴 Elite' : found.playerTier==='mid' ? '🟡 Mid' : '⚪ Underdog')
+        : null;
+      const potLabel = found.pot ? `P${found.pot}` : null;
+      const statsLine = s.mp > 0
+        ? `\nSeason record: ${s.mp} played · ${s.w}W ${s.d}D ${s.l}L · ${s.pts} pts`
+        : '\nSeason record: No matches played yet';
+      const tierLine = tier ? `\nTier: ${tier}` : '';
+      const potLine  = potLabel ? ` · ${potLabel}` : '';
+
       await sendTelegram(chatId,
-        `✅ <b>Telegram linked successfully!</b>\n\nYou'll now receive match notifications here for <b>${found.clubName||found.gameName}</b>.\n\nCommands:\n/status — your current season stats\n/fixtures — upcoming matches`);
+        `✅ <b>You're linked! Welcome to CEE.</b>\n\n`
+        + `🎮 <b>${found.clubName || found.gameName}</b>${potLine}${tierLine}`
+        + statsLine
+        + `\n\n🔔 You'll now receive instant alerts for:\n`
+        + `  • Match window opening\n`
+        + `  • Opponent ready check-in\n`
+        + `  • Result approvals\n`
+        + `  • League announcements\n\n`
+        + `📋 <b>Your commands:</b>\n`
+        + `/status — your current stats &amp; rank\n`
+        + `/fixtures — your upcoming matches\n`
+        + `/help — all commands`);
+
+      // Notify admin that a player has linked
+      const adminChat = env.telegram && env.telegram.admin_chat_id;
+      if (adminChat) {
+        await sendTelegram(adminChat,
+          `📱 <b>Player linked Telegram</b>\n${found.clubName||found.gameName} (@${username||'no username'})${potLine}`
+        ).catch(()=>{});
+      }
+
       await audit('TELEGRAM_LINKED',found.id,'player',`ChatId ${chatId} linked via /start`);
     }
     else if (text==='/status') {
@@ -4034,6 +4151,18 @@ app.post('/telegramWebhook', async (req, res) => {
       let msg=`📅 <b>Your upcoming fixtures:</b>\n\n`;
       for (const d of mine){ const f=d.data(); const opp=f.playerAId===playerId?(f.playerBName||f.playerBId):(f.playerAName||f.playerAId); msg+=`vs <b>${opp}</b>\nStatus: ${f.status}\n\n`; }
       await sendTelegram(chatId,msg);
+    }
+    else if (text==='/help') {
+      await sendTelegram(chatId,
+        `⚡ <b>CEE Bot Commands</b>\n\n`
+        + `/status — your stats, rank &amp; tier\n`
+        + `/fixtures — your upcoming matches\n`
+        + `/help — show this list\n\n`
+        + `To link your account, send:\n`
+        + `<code>/start YourGamingTag</code>\n`
+        + `or\n`
+        + `<code>/start YourPlayerID</code> (from the hub)\n\n`
+        + `Visit the CEE Player Hub for match details, fixtures and scores.`);
     }
   } catch(e){ console.error('[CEE] telegramWebhook:',e.message); }
 });
@@ -6539,6 +6668,18 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`[CEE] ✅ Backend running on port ${PORT}`);
   console.log(`[CEE] URL: https://campus-esports-elite-backend2-production.up.railway.app`);
+  // Load tokens from Firestore adminSettings (bridges admin UI → backend runtime)
+  // This allows admin to save TELEGRAM_TOKEN + Brevo keys via the Season Clock UI
+  // without needing to set Railway env vars manually
+  _loadTokensFromFirestore().then(() => {
+    // Re-run env check after Firestore token load
+    const tgOk = !!(env.telegram && env.telegram.token);
+    const brevoOk = _brevoAccounts.length > 0;
+    if (tgOk)    console.log('[CEE] ✅ Telegram: token configured and ready');
+    else         console.warn('[CEE] ⚠️  Telegram: no token — set TELEGRAM_TOKEN in Railway or save via Season Clock → API Keys');
+    if (brevoOk) console.log(`[CEE] ✅ Brevo: ${_brevoAccounts.length} account(s) ready — ${_brevoAccounts.length * 295} emails/day`);
+    else         console.warn('[CEE] ⚠️  Brevo: no accounts — set BREVO_KEY_1+BREVO_FROM_1 in Railway or save via Season Clock → API Keys');
+  }).catch(() => {});
   // Startup env check — show what's configured and what's missing
   const checks = {
     'FIREBASE_SERVICE_ACCOUNT': !!(serviceAccount && serviceAccount.project_id),
